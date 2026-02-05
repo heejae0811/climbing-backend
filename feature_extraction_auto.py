@@ -11,7 +11,7 @@ from mediapipe.tasks.python.vision.core import image as mp_image
 # ==========================================================
 # 0. 기본 설정
 # ==========================================================
-VIDEO_DIR = "./ff/"
+VIDEO_DIR = "./v/"
 OUTPUT_DIR = "./features_xlsx_all/"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
