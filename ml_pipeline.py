@@ -6,15 +6,16 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 from matplotlib import pyplot as plt
-from sklearn.feature_selection import RFECV
-from sklearn.model_selection import StratifiedKFold, GridSearchCV, train_test_split
+from sklearn.model_selection import StratifiedKFold, GridSearchCV, train_test_split, cross_val_score
 from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
 from sklearn.metrics import (
     confusion_matrix, precision_score, recall_score, f1_score,
     matthews_corrcoef, roc_auc_score, balanced_accuracy_score,
-    roc_curve, auc, make_scorer
+    roc_curve, auc
 )
-from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.base import BaseEstimator, ClassifierMixin, clone
+from sklearn.inspection import permutation_importance
 from sklearn.linear_model import LogisticRegression
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.svm import SVC
@@ -25,6 +26,8 @@ from xgboost import XGBClassifier
 from catboost import CatBoostClassifier
 from lime.lime_tabular import LimeTabularExplainer
 import joblib
+import optuna
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
 # =====================================================
@@ -50,56 +53,51 @@ class CatBoostClassifierSklearn(CatBoostClassifier, ClassifierMixin, BaseEstimat
 
 # =====================================================
 # 1단계: 데이터 불러오기
-#   - id, label, total_time은 ML 분석에서 제외
+#   - id, label, total_time, body_size_median 제외
+#   - 수치형 feature만 자동 선택
 # =====================================================
 def data_loading():
     print("\n[1단계] Data Loading")
 
-    files = glob.glob("./features_xlsx_all/*.xlsx")
+    files = glob.glob("./features_xlsx/*.xlsx")
     print(f"찾은 파일 수: {len(files)}")
 
     if len(files) == 0:
-        raise FileNotFoundError("❌ 폴더에 엑셀 파일이 없습니다. ./features_xlsx 폴더 확인 필요")
+        raise FileNotFoundError("폴더에 엑셀 파일이 없습니다.")
 
-    df_list = [pd.read_excel(f) for f in files]
-    df = pd.concat(df_list, ignore_index=True)
+    df = pd.concat([pd.read_excel(f) for f in files], ignore_index=True)
 
     if "label" not in df.columns:
-        raise KeyError("❌ label 컬럼이 없습니다. 데이터 파일을 확인하세요.")
+        raise KeyError("label 컬럼이 없습니다.")
 
-    # y 라벨
     y = df["label"].astype(int).values
     class_names = ["Advanced", "Intermediate"]
     label_counts = np.bincount(y)
 
-    # 수치형 feature 자동 선택
-    feature_cols = df.select_dtypes(include=["float64", "int64"]).columns.tolist()
-
-    # ML에서 제외할 변수
     exclude_features = ["id", "label", "total_time", "body_size_median"]
+    feature_cols = df.select_dtypes(include=["float64", "int64"]).columns.tolist()
     feature_cols = [c for c in feature_cols if c not in exclude_features]
 
     X = df[feature_cols]
 
-    # 결측치 확인
     total_missing = X.isnull().sum().sum()
     print(f"결측치 개수: {total_missing}")
-
     if total_missing > 0:
-        print("⚠️ 경고: 결측치가 존재합니다. (현재 코드는 별도 처리 없이 진행)")
+        print("경고: 결측치가 존재합니다.")
 
-    print(f"최종 Feature 개수: {len(feature_cols)}")
-    print(f"클래스 분포: Advanced(0)- {label_counts[0]}개, Intermediate(1) - {label_counts[1]}개")
+    print(f"Feature 개수: {len(feature_cols)}")
+    print(f"클래스 분포: Advanced(0)={label_counts[0]}개, Intermediate(1)={label_counts[1]}개")
 
     return X, y, feature_cols, class_names
 
 
 # =====================================================
-# 2단계: Data Split (Train/Test)
-#   - Test 데이터는 이후 모든 과정에서 완전 분리
+# 2단계: Train / Test 분리
+#   - stratify로 클래스 비율 유지
+#   - Test는 최종 평가에만 사용, 학습/튜닝에 절대 미사용
 # =====================================================
 def data_split(X, y, test_size=0.2):
-    print("\n[2단계] Data Split (Train/Test)")
+    print("\n[2단계] Train/Test Split (80:20, Stratified)")
 
     X_train, X_test, y_train, y_test = train_test_split(
         X, y,
@@ -108,8 +106,7 @@ def data_split(X, y, test_size=0.2):
         random_state=RANDOM_STATE
     )
 
-    print(f"Train 샘플 수: {len(X_train)}")
-    print(f"Test  샘플 수: {len(X_test)}")
+    print(f"Train: {len(X_train)}개  |  Test: {len(X_test)}개")
     print(f"Train 클래스 분포: {np.bincount(y_train)}")
     print(f"Test  클래스 분포: {np.bincount(y_test)}")
 
@@ -117,385 +114,453 @@ def data_split(X, y, test_size=0.2):
 
 
 # =====================================================
-# 3단계: Feature Selection (RFECV)
-#   - Train 데이터만 사용
-#   - Logistic Regression + MCC 기반
+# 3단계: Feature Selection
+#   [방법] RF Embedded + Permutation Importance
+#   [CV]   Train 내 5-fold Stratified CV
+#   [기준] MCC (모델 학습/튜닝 기준과 통일)
+#   [선택] 5-fold importance 평균 >= 전체 평균 (threshold)
+#   [보장] Train 데이터만 사용, Test leakage 없음
 # =====================================================
-def feature_selection_rfecv(X_train, y_train, min_features=5):
-    print("\n[3단계] Feature Selection (RFECV - Logistic Regression 기반)")
-
-    # 여기서 사용하는 스케일러는 feature 선택용 전용 (ML 스케일러와 별개)
-    scaler = StandardScaler()
-    X_train_scaled = pd.DataFrame(
-        scaler.fit_transform(X_train),
-        columns=X_train.columns,
-        index=X_train.index
-    )
-
-    estimator = LogisticRegression(
-        max_iter=1000,
-        random_state=RANDOM_STATE
-    )
+def feature_selection(X_train, y_train, min_features=5):
+    print("\n[3단계] Feature Selection (RF + Permutation Importance + 5-Fold CV + MCC)")
 
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
-    mcc_scorer = make_scorer(matthews_corrcoef)
+    importance_matrix = np.zeros((5, X_train.shape[1]))
 
-    rfecv = RFECV(
-        estimator=estimator,
-        step=1,
-        cv=cv,
-        scoring=mcc_scorer,
-        min_features_to_select=min_features,
-        n_jobs=-1
-    )
+    for fold_idx, (train_idx, val_idx) in enumerate(cv.split(X_train, y_train)):
+        X_fold_train = X_train.iloc[train_idx]
+        y_fold_train = y_train[train_idx]
+        X_fold_val   = X_train.iloc[val_idx]
+        y_fold_val   = y_train[val_idx]
 
-    rfecv.fit(X_train_scaled, y_train)
+        # RF를 Train fold로 학습
+        rf = RandomForestClassifier(
+            n_estimators=300,
+            random_state=RANDOM_STATE,
+            n_jobs=-1
+        )
+        rf.fit(X_fold_train, y_fold_train)
 
-    selected_mask = rfecv.support_
-    selected_features = X_train.columns[selected_mask].tolist()
+        # Validation fold에서 MCC 기준 permutation importance 계산
+        perm = permutation_importance(
+            rf, X_fold_val, y_fold_val,
+            scoring="matthews_corrcoef",
+            n_repeats=5,
+            random_state=RANDOM_STATE,
+            n_jobs=-1
+        )
+        importance_matrix[fold_idx] = perm.importances_mean
 
-    df_sel = pd.DataFrame({"Selected_Features": selected_features})
-    selected_path = os.path.join(RESULT_DIR, "selected_features.xlsx")
-    df_sel.to_excel(selected_path, index=False)
+    # 5-fold importance 평균
+    mean_importances = importance_matrix.mean(axis=0)
 
-    print(f"Selected Features: {len(selected_features)}개 \n", selected_features)
+    df_importance = pd.DataFrame({
+        "Feature":    X_train.columns,
+        "Importance": mean_importances
+    }).sort_values("Importance", ascending=False).reset_index(drop=True)
+
+    # threshold: 전체 importance 평균 이상인 feature 선택
+    threshold = mean_importances.mean()
+    selected  = df_importance[df_importance["Importance"] >= threshold]
+    if len(selected) < min_features:
+        selected = df_importance.head(min_features)
+
+    selected_features = selected["Feature"].tolist()
+
+    print(f"Importance threshold: {threshold:.4f}")
+    print(f"Selected Features ({len(selected_features)}개): {selected_features}")
+    print(df_importance.to_string(index=False))
+
+    df_importance.to_excel(
+        os.path.join(RESULT_DIR, "feature_selection_importance.xlsx"), index=False)
+    pd.DataFrame({"Selected_Features": selected_features}).to_excel(
+        os.path.join(RESULT_DIR, "selected_features.xlsx"), index=False)
 
     return selected_features
 
 
 # =====================================================
-# Feature Scaling (모델별)
-#   - Logistic, KNN, SVM만 스케일링
+# 4단계: 모델 정의 (8개)
+#   - 스케일링 필요(LR, KNN, SVM): Pipeline에 StandardScaler 포함
+#   - 스케일링 불필요(DT, RF, LGBM, XGB, CAT): StandardScaler 미포함
+#   - Pipeline으로 통일 → scaler와 model 항상 세트
+#   - clone()으로 Base/GridSearch/Optuna 독립 학습 보장
 # =====================================================
-def feature_scaling(X_train, X_test, selected_features, model_name):
-    scaling_required = ["Logistic Regression", "KNN", "SVM"]
-
-    X_train_fs = X_train[selected_features]
-    X_test_fs = X_test[selected_features]
-
-    if model_name not in scaling_required:
-        print(f"⚠ 스케일링 생략: {model_name}")
-        return X_train_fs, X_test_fs, None
-
-    print(f"✔ 스케일링 적용: {model_name}")
-    scaler = StandardScaler()
-    scaler.fit(X_train_fs)
-
-    X_train_scaled = pd.DataFrame(
-        scaler.transform(X_train_fs),
-        columns=selected_features,
-        index=X_train.index
-    )
-
-    X_test_scaled = pd.DataFrame(
-        scaler.transform(X_test_fs),
-        columns=selected_features,
-        index=X_test.index
-    )
-
-    return X_train_scaled, X_test_scaled, scaler
-
-
-# =====================================================
-# 4단계: ML 모델 정의
-#   - Base 모델들 정의
-# =====================================================
-def model_development():
-    print("\n[4단계] ML 모델 생성")
+def build_models():
+    print("\n[4단계] 모델 정의 (8개, Pipeline 기반)")
 
     models = {
-        "Logistic Regression": LogisticRegression(
-            max_iter=1000,
-            random_state=RANDOM_STATE
-        ),
-        "KNN": KNeighborsClassifier(),
-        "SVM": SVC(
-            probability=True,
-            random_state=RANDOM_STATE
-        ),
-        "Decision Tree": DecisionTreeClassifier(
-            random_state=RANDOM_STATE
-        ),
-        "Random Forest": RandomForestClassifier(
-            n_estimators=200,
-            random_state=RANDOM_STATE,
-            n_jobs=-1
-        ),
-        "LightGBM": LGBMClassifier(
-            random_state=RANDOM_STATE,
-            n_jobs=-1,
-            verbose=-1
-        ),
-        "XGBoost": XGBClassifier(
-            random_state=RANDOM_STATE,
-            eval_metric="logloss",
-            n_jobs=-1,
-            use_label_encoder=False
-        ),
-        "CatBoost": CatBoostClassifierSklearn(
-            random_state=RANDOM_STATE,
-            verbose=False
-        )
+        # ── 스케일링 필요 모델 (거리/경계 기반) ───────────
+        "Logistic Regression": Pipeline([
+            ("scaler", StandardScaler()),
+            ("model", LogisticRegression(
+                max_iter=1000, C=1.0, solver="lbfgs",
+                random_state=RANDOM_STATE
+            ))
+        ]),
+        "KNN": Pipeline([
+            ("scaler", StandardScaler()),
+            ("model", KNeighborsClassifier(
+                n_neighbors=7, weights="distance", metric="euclidean"
+            ))
+        ]),
+        "SVM": Pipeline([
+            ("scaler", StandardScaler()),
+            ("model", SVC(
+                C=1.0, kernel="rbf", gamma="scale",
+                probability=True, random_state=RANDOM_STATE
+            ))
+        ]),
+        # ── 스케일링 불필요 모델 (트리 기반) ─────────────
+        "Decision Tree": Pipeline([
+            ("model", DecisionTreeClassifier(
+                max_depth=5, min_samples_split=10, min_samples_leaf=5,
+                random_state=RANDOM_STATE
+            ))
+        ]),
+        "Random Forest": Pipeline([
+            ("model", RandomForestClassifier(
+                n_estimators=300, max_depth=10,
+                min_samples_split=10, min_samples_leaf=5,
+                max_features="sqrt", random_state=RANDOM_STATE, n_jobs=-1
+            ))
+        ]),
+        "LightGBM": Pipeline([
+            ("model", LGBMClassifier(
+                n_estimators=200, num_leaves=15, learning_rate=0.05,
+                min_child_samples=20, random_state=RANDOM_STATE,
+                n_jobs=-1, verbose=-1
+            ))
+        ]),
+        "XGBoost": Pipeline([
+            ("model", XGBClassifier(
+                n_estimators=200, max_depth=4, learning_rate=0.05,
+                subsample=0.8, colsample_bytree=0.8,
+                eval_metric="logloss", random_state=RANDOM_STATE, n_jobs=-1
+            ))
+        ]),
+        "CatBoost": Pipeline([
+            ("model", CatBoostClassifierSklearn(
+                iterations=200, depth=4, learning_rate=0.05,
+                l2_leaf_reg=5, random_state=RANDOM_STATE, verbose=False
+            ))
+        ])
     }
 
-    print(f"모델 개수: {len(models)}개")
+    for name, pipe in models.items():
+        has_scaler = "scaler" in pipe.named_steps
+        print(f"  {name}: {'스케일링 O' if has_scaler else '스케일링 X'}")
 
     return models
 
 
 # =====================================================
-# 5단계: 모델 학습 및 평가 (Base)
+# GridSearch 파라미터 그리드
+#   - 200-300샘플 소규모 균형 이진분류 기준
+#   - 과적합 방지 파라미터 위주
+#   - model__ prefix: Pipeline 내부 step 지정
 # =====================================================
-def model_evaluation(model, X_train, y_train, X_test, y_test, model_name):
-    model.fit(X_train, y_train)
-
-    y_pred = model.predict(X_test)
-    y_proba = model.predict_proba(X_test)[:, 1]
-
-    cm = confusion_matrix(y_test, y_pred)
-    tn, fp, fn, tp = cm.ravel()
-
-    accuracy = (y_pred == y_test).mean()
-    precision = precision_score(y_test, y_pred, zero_division=0)
-    recall = recall_score(y_test, y_pred, zero_division=0)
-    f1 = f1_score(y_test, y_pred, zero_division=0)
-    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
-    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
-    bal_acc = balanced_accuracy_score(y_test, y_pred)
-    mcc = matthews_corrcoef(y_test, y_pred)
-    auc_score = roc_auc_score(y_test, y_proba)
-
-    metrics = {
-        "Model": model_name + " (Base)",
-        "Accuracy": accuracy,
-        "Precision": precision,
-        "Recall": recall,
-        "F1": f1,
-        "Specificity": specificity,
-        "Sensitivity": sensitivity,
-        "Balanced_Accuracy": bal_acc,
-        "MCC": mcc,
-        "AUC": auc_score
-    }
-
-    print(f"기본 모델 결과 [{model_name}] | "f"Acc={accuracy:.3f}, F1={f1:.3f}, MCC={mcc:.3f}, AUC={auc_score:.3f}")
-
-    return model, y_pred, y_proba, mcc, metrics
-
-
-# =====================================================
-# GridSearchCV 설정 (모델별)
-# =====================================================
-def get_param_grid(model_name):
+def get_gridsearch_params(model_name):
     grids = {
         "Logistic Regression": {
-            "C": [0.01, 0.1, 1, 10]
+            "model__C": [0.01, 0.1, 1, 10]
         },
         "KNN": {
-            "n_neighbors": [3, 5, 7, 9],
-            "weights": ["uniform", "distance"]
+            "model__n_neighbors": [5, 7, 9, 11, 13],
+            "model__weights":     ["uniform", "distance"]
         },
         "SVM": {
-            "C": [0.1, 1, 10],
-            "gamma": ["scale", "auto"],
-            "kernel": ["rbf", "poly"]
+            "model__C":     [0.1, 1, 10],
+            "model__gamma": ["scale", "auto"]
         },
         "Decision Tree": {
-            "max_depth": [3, 5, 7, None],
-            "min_samples_split": [2, 5, 10]
+            "model__max_depth":        [3, 4, 5],
+            "model__min_samples_leaf": [5, 10, 15]
         },
         "Random Forest": {
-            "n_estimators": [100, 200, 300],
-            "max_depth": [None, 5, 10],
-            "min_samples_split": [2, 5]
+            "model__n_estimators":     [200, 300],
+            "model__max_depth":        [5, 7, 10],
+            "model__min_samples_leaf": [5, 10]
         },
         "LightGBM": {
-            "num_leaves": [15, 31, 63],
-            "learning_rate": [0.001, 0.01, 0.1]
+            "model__num_leaves":        [10, 15, 20],
+            "model__learning_rate":     [0.01, 0.05, 0.1],
+            "model__min_child_samples": [20, 30]
         },
         "XGBoost": {
-            "learning_rate": [0.01, 0.1, 0.2],
-            "max_depth": [3, 5, 7]
+            "model__max_depth":     [3, 4, 5],
+            "model__learning_rate": [0.01, 0.05, 0.1],
+            "model__subsample":     [0.8, 1.0]
         },
         "CatBoost": {
-            "depth": [4, 6, 8],
-            "learning_rate": [0.01, 0.05, 0.1]
+            "model__depth":         [3, 4, 5],
+            "model__learning_rate": [0.01, 0.05, 0.1],
+            "model__l2_leaf_reg":   [3, 5, 10]
         }
     }
     return grids.get(model_name, None)
 
 
 # =====================================================
-# GridSearchCV 기반 평가 (Tuned)
-#   - scoring = MCC
+# Optuna 파라미터 탐색 범위
+#   - GridSearch와 동일 범위를 연속적으로 탐색
+#   - 200-300샘플 기준, 과적합 방지 위주
 # =====================================================
-def evaluate_with_gridsearch(model, X_train, y_train, X_test, y_test, model_name):
-    param_grid = get_param_grid(model_name)
+def get_optuna_params(trial, model_name):
+    if model_name == "Logistic Regression":
+        return {"model__C": trial.suggest_float("C", 0.01, 10, log=True)}
+    elif model_name == "KNN":
+        return {
+            "model__n_neighbors": trial.suggest_int("n_neighbors", 5, 13),
+            "model__weights":     trial.suggest_categorical("weights", ["uniform", "distance"])
+        }
+    elif model_name == "SVM":
+        return {
+            "model__C":     trial.suggest_float("C", 0.1, 10, log=True),
+            "model__gamma": trial.suggest_categorical("gamma", ["scale", "auto"])
+        }
+    elif model_name == "Decision Tree":
+        return {
+            "model__max_depth":        trial.suggest_int("max_depth", 3, 5),
+            "model__min_samples_leaf": trial.suggest_int("min_samples_leaf", 5, 15)
+        }
+    elif model_name == "Random Forest":
+        return {
+            "model__n_estimators":     trial.suggest_int("n_estimators", 200, 300),
+            "model__max_depth":        trial.suggest_int("max_depth", 5, 10),
+            "model__min_samples_leaf": trial.suggest_int("min_samples_leaf", 5, 10)
+        }
+    elif model_name == "LightGBM":
+        return {
+            "model__num_leaves":        trial.suggest_int("num_leaves", 10, 20),
+            "model__learning_rate":     trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
+            "model__min_child_samples": trial.suggest_int("min_child_samples", 20, 30)
+        }
+    elif model_name == "XGBoost":
+        return {
+            "model__max_depth":     trial.suggest_int("max_depth", 3, 5),
+            "model__learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
+            "model__subsample":     trial.suggest_float("subsample", 0.8, 1.0)
+        }
+    elif model_name == "CatBoost":
+        return {
+            "model__depth":         trial.suggest_int("depth", 3, 5),
+            "model__learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
+            "model__l2_leaf_reg":   trial.suggest_float("l2_leaf_reg", 3, 10)
+        }
+    return {}
 
-    if param_grid is None:
-        print(f"❌ GridSearch 미지원 모델: {model_name}")
-        return None, None, None, None, None
 
-    print(f"✔ GridSearchCV 실행: {model_name} (scoring = MCC)")
-
-    grid = GridSearchCV(
-        estimator=model,
-        param_grid=param_grid,
-        cv=5,
-        scoring="matthews_corrcoef",
-        n_jobs=-1
-    )
-
-    grid.fit(X_train, y_train)
-    best_model = grid.best_estimator_
-    print(f"{model_name} Best Params: {grid.best_params_}")
-
-    y_pred = best_model.predict(X_test)
-    y_proba = best_model.predict_proba(X_test)[:, 1]
-
+# =====================================================
+# 공통 평가 지표 계산
+# =====================================================
+def compute_metrics(model_label, y_test, y_pred, y_proba):
     cm = confusion_matrix(y_test, y_pred)
     tn, fp, fn, tp = cm.ravel()
 
-    accuracy = (y_pred == y_test).mean()
-    precision = precision_score(y_test, y_pred, zero_division=0)
-    recall = recall_score(y_test, y_pred, zero_division=0)
-    f1 = f1_score(y_test, y_pred, zero_division=0)
-    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
-    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
-    bal_acc = balanced_accuracy_score(y_test, y_pred)
-    mcc = matthews_corrcoef(y_test, y_pred)
-    auc_score = roc_auc_score(y_test, y_proba)
-
-    metrics = {
-        "Model": model_name + " (Tuned)",
-        "Accuracy": accuracy,
-        "Precision": precision,
-        "Recall": recall,
-        "F1": f1,
-        "Specificity": specificity,
-        "Sensitivity": sensitivity,
-        "Balanced_Accuracy": bal_acc,
-        "MCC": mcc,
-        "AUC": auc_score
+    return {
+        "Model":             model_label,
+        "Accuracy":          (y_pred == y_test).mean(),
+        "Precision":         precision_score(y_test, y_pred, zero_division=0),
+        "Recall":            recall_score(y_test, y_pred, zero_division=0),
+        "F1":                f1_score(y_test, y_pred, zero_division=0),
+        "Specificity":       tn / (tn + fp) if (tn + fp) > 0 else 0,
+        "Sensitivity":       tp / (tp + fn) if (tp + fn) > 0 else 0,
+        "Balanced_Accuracy": balanced_accuracy_score(y_test, y_pred),
+        "MCC":               matthews_corrcoef(y_test, y_pred),
+        "AUC":               roc_auc_score(y_test, y_proba)
     }
 
-    print(f"GridSearch 튜닝 결과 [{model_name}] | " f"Acc={accuracy:.3f}, F1={f1:.3f}, MCC={mcc:.3f}, AUC={auc_score:.3f} \n")
 
-    return best_model, y_pred, y_proba, mcc, metrics
+# =====================================================
+# 5-1: Base 모델 학습 및 평가
+#   - clone(): 초기화된 복사본 → GridSearch/Optuna와 완전 독립
+#   - X_train으로만 학습
+#   - X_test로 최종 1회 평가
+# =====================================================
+def evaluate_base(pipeline, model_name, X_train, y_train, X_test, y_test):
+    model = clone(pipeline)             # 초기 상태 보장
+    model.fit(X_train, y_train)         # Train만 사용
+
+    y_pred  = model.predict(X_test)
+    y_proba = model.predict_proba(X_test)[:, 1]
+    metrics = compute_metrics(f"{model_name} (Base)", y_test, y_pred, y_proba)
+
+    print(f"  [Base]       Acc={metrics['Accuracy']:.3f} | "
+          f"MCC={metrics['MCC']:.3f} | AUC={metrics['AUC']:.3f}")
+
+    return model, y_proba, metrics
 
 
 # =====================================================
-# 6단계: 엑셀 저장 및 시각화
-#   - final_results.xlsx
-#   - Confusion Matrix (Best Model)
-#   - ROC Curve (Base / Tuned 별도 그래프)
-#   - Feature Importance 엑셀 + Plot
+# 5-2: GridSearch 학습 및 평가
+#   - clone(): Base와 완전 독립된 초기 상태
+#   - Train 내 5-fold CV로 파라미터 탐색 (MCC 기준)
+#   - refit=True: best params로 전체 Train 재학습
+#   - X_test로 최종 1회 평가
 # =====================================================
-def save_results(results_list, y_test, y_proba_base, y_proba_tuned, best_model_name, best_model, X_test_fs, selected_features, class_names):
-    print("\n[6단계] 엑셀 저장 및 시각화")
+def evaluate_gridsearch(pipeline, model_name, X_train, y_train, X_test, y_test):
+    param_grid = get_gridsearch_params(model_name)
+    if param_grid is None:
+        return None, None, None
 
-    # 결과 엑셀
-    df_results = pd.DataFrame(results_list)
-    df_results_sorted = df_results.sort_values("MCC", ascending=False)
-    excel_path = os.path.join(RESULT_DIR, "final_results.xlsx")
-    df_results_sorted.to_excel(excel_path, index=False)
-    print(f"성능 지표 엑셀 저장 완료: {excel_path}")
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
 
-    # Confusion Matrix (Best)
+    grid = GridSearchCV(
+        estimator=clone(pipeline),      # 초기 상태 보장
+        param_grid=param_grid,
+        cv=cv,                          # Train 내 5-fold CV
+        scoring="matthews_corrcoef",    # MCC 기준
+        refit=True,                     # best params로 전체 Train 재학습
+        n_jobs=-1
+    )
+    grid.fit(X_train, y_train)          # Train만 사용
+
+    best_model = grid.best_estimator_
+    print(f"  [GridSearch] Best: {grid.best_params_}")
+
+    y_pred  = best_model.predict(X_test)
+    y_proba = best_model.predict_proba(X_test)[:, 1]
+    metrics = compute_metrics(f"{model_name} (GridSearch)", y_test, y_pred, y_proba)
+
+    print(f"  [GridSearch] Acc={metrics['Accuracy']:.3f} | "
+          f"MCC={metrics['MCC']:.3f} | AUC={metrics['AUC']:.3f}")
+
+    return best_model, y_proba, metrics
+
+
+# =====================================================
+# 5-3: Optuna 학습 및 평가
+#   - clone(): Base/GridSearch와 완전 독립된 초기 상태
+#   - Objective: Train 내 5-fold CV MCC 평균 최대화
+#   - Best params로 전체 Train 재학습
+#   - X_test로 최종 1회 평가
+# =====================================================
+def evaluate_optuna(pipeline, model_name, X_train, y_train, X_test, y_test, n_trials=50):
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+
+    def objective(trial):
+        params = get_optuna_params(trial, model_name)
+        if not params:
+            return 0.0
+        pipe = clone(pipeline)          # 매 trial마다 초기 상태
+        pipe.set_params(**params)
+        # Train 내 5-fold CV MCC 평균 최대화
+        scores = cross_val_score(
+            pipe, X_train, y_train,
+            cv=cv, scoring="matthews_corrcoef"
+        )
+        return scores.mean()
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE)
+    )
+    study.optimize(objective, n_trials=n_trials)
+
+    # Best params로 전체 Train 재학습
+    best_params = get_optuna_params(study.best_trial, model_name)
+    best_model  = clone(pipeline)       # 초기 상태 보장
+    best_model.set_params(**best_params)
+    best_model.fit(X_train, y_train)    # Train만 사용
+
+    print(f"  [Optuna]     Best: {study.best_params}")
+
+    y_pred  = best_model.predict(X_test)
+    y_proba = best_model.predict_proba(X_test)[:, 1]
+    metrics = compute_metrics(f"{model_name} (Optuna)", y_test, y_pred, y_proba)
+
+    print(f"  [Optuna]     Acc={metrics['Accuracy']:.3f} | "
+          f"MCC={metrics['MCC']:.3f} | AUC={metrics['AUC']:.3f}")
+
+    return best_model, y_proba, metrics
+
+
+# =====================================================
+# 6단계: 결과 저장 및 시각화
+# =====================================================
+def save_results(results_list, y_test,
+                 y_proba_base, y_proba_gs, y_proba_optuna,
+                 best_model_name, best_model,
+                 X_test_fs, selected_features, class_names):
+    print("\n[6단계] 결과 저장 및 시각화")
+
+    # 성능 지표 엑셀 (MCC 기준 내림차순)
+    df_results = pd.DataFrame(results_list).sort_values("MCC", ascending=False)
+    df_results.to_excel(os.path.join(RESULT_DIR, "final_results.xlsx"), index=False)
+    print("성능 지표 저장: final_results.xlsx")
+
+    # Confusion Matrix (Best Model)
     y_pred_best = best_model.predict(X_test_fs)
     cm = confusion_matrix(y_test, y_pred_best)
-
-    plt.figure(figsize=(10, 7))
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=class_names, yticklabels=class_names)
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=class_names, yticklabels=class_names)
     plt.title(f"Confusion Matrix - {best_model_name}")
-    plt.xlabel("Predicted")
-    plt.ylabel("True")
+    plt.xlabel("Predicted Label")
+    plt.ylabel("True Label")
     plt.tight_layout()
-    cm_path = os.path.join(RESULT_DIR, "best_confusion_matrix.png")
-    plt.savefig(cm_path, dpi=300)
+    plt.savefig(os.path.join(RESULT_DIR, "best_confusion_matrix.png"), dpi=300)
     plt.close()
-    print(f"Confusion Matrix 저장: {cm_path}")
+    print("Confusion Matrix 저장 완료")
 
-    # ROC Curve (Base Models)
-    if len(y_proba_base) > 0:
-        plt.figure(figsize=(10, 7))
-        for name, y_proba in y_proba_base.items():
+    # ROC Curve (Base / GridSearch / Optuna 각각)
+    for label, y_proba_dict, fname in [
+        ("Base Models",       y_proba_base,   "roc_base.png"),
+        ("GridSearch Models", y_proba_gs,     "roc_gridsearch.png"),
+        ("Optuna Models",     y_proba_optuna, "roc_optuna.png"),
+    ]:
+        if not y_proba_dict:
+            continue
+        plt.figure(figsize=(8, 6))
+        for name, y_proba in y_proba_dict.items():
             fpr, tpr, _ = roc_curve(y_test, y_proba)
-            roc_auc = auc(fpr, tpr)
-            plt.plot(fpr, tpr, lw=2, label=f"{name} (AUC={roc_auc:.3f})")
-
+            plt.plot(fpr, tpr, lw=2, label=f"{name} (AUC={auc(fpr, tpr):.3f})")
         plt.plot([0, 1], [0, 1], "k--", label="Random")
         plt.xlabel("False Positive Rate")
         plt.ylabel("True Positive Rate")
-        plt.title("ROC Curve - Base Models")
+        plt.title(f"ROC Curve - {label}")
         plt.legend(loc="lower right", fontsize=8)
         plt.grid(alpha=0.3)
         plt.tight_layout()
-        roc_base_path = os.path.join(RESULT_DIR, "roc_base_models.png")
-        plt.savefig(roc_base_path, dpi=300)
+        plt.savefig(os.path.join(RESULT_DIR, fname), dpi=300)
         plt.close()
-        print(f"ROC(Base) 저장: {roc_base_path}")
+        print(f"ROC Curve 저장: {fname}")
 
-    # ROC Curve (Tuned Models)
-    if len(y_proba_tuned) > 0:
-        plt.figure(figsize=(10, 7))
-        for name, y_proba in y_proba_tuned.items():
-            fpr, tpr, _ = roc_curve(y_test, y_proba)
-            roc_auc = auc(fpr, tpr)
-            plt.plot(fpr, tpr, lw=2, label=f"{name} (AUC={roc_auc:.3f})")
-
-        plt.plot([0, 1], [0, 1], "k--", label="Random")
-        plt.xlabel("False Positive Rate")
-        plt.ylabel("True Positive Rate")
-        plt.title("ROC Curve - Tuned Models (GridSearch)")
-        plt.legend(loc="lower right", fontsize=8)
-        plt.grid(alpha=0.3)
-        plt.tight_layout()
-        roc_tuned_path = os.path.join(RESULT_DIR, "roc_tuned_models.png")
-        plt.savefig(roc_tuned_path, dpi=300)
-        plt.close()
-        print(f"ROC(Tuned) 저장: {roc_tuned_path}")
-
-    # Feature Importance
-    if hasattr(best_model, "feature_importances_"):
-        importances = best_model.feature_importances_
-    else:
-        from sklearn.inspection import permutation_importance
-        perm = permutation_importance(
-            best_model,
-            X_test_fs,
-            y_test,
-            scoring="matthews_corrcoef",
-            n_repeats=10,
-            random_state=RANDOM_STATE
-        )
-        importances = perm.importances_mean
-
+    # Feature Importance (MCC 기준 permutation importance)
+    # → 모든 모델에 동일 기준 적용 (논문 일관성)
+    perm = permutation_importance(
+        best_model, X_test_fs, y_test,
+        scoring="matthews_corrcoef",
+        n_repeats=10,
+        random_state=RANDOM_STATE
+    )
     df_fi = pd.DataFrame({
-        "Feature": selected_features,
-        "Importance": importances
-    })
-    fi_excel_path = os.path.join(RESULT_DIR, "feature_importance.xlsx")
-    df_fi.to_excel(fi_excel_path, index=False)
-    print(f"Feature Importance 엑셀 저장: {fi_excel_path}")
+        "Feature":    selected_features,
+        "Importance": perm.importances_mean,
+        "Std":        perm.importances_std
+    }).sort_values("Importance", ascending=False)
 
-    plt.figure(figsize=(10, 7))
-    df_fi_sorted = df_fi.sort_values("Importance", ascending=False)
-    plt.barh(df_fi_sorted["Feature"], df_fi_sorted["Importance"])
+    df_fi.to_excel(os.path.join(RESULT_DIR, "feature_importance.xlsx"), index=False)
+
+    plt.figure(figsize=(8, 6))
+    plt.barh(df_fi["Feature"], df_fi["Importance"],
+             xerr=df_fi["Std"], align="center")
     plt.gca().invert_yaxis()
-    plt.title(f"Feature Importance - {best_model_name}")
-    plt.xlabel("Importance")
+    plt.title(f"Feature Importance (Permutation, MCC) - {best_model_name}")
+    plt.xlabel("Mean Importance")
     plt.tight_layout()
-    fi_plot_path = os.path.join(RESULT_DIR, "feature_importance_plot.png")
-    plt.savefig(fi_plot_path, dpi=300)
+    plt.savefig(os.path.join(RESULT_DIR, "feature_importance_plot.png"), dpi=300)
     plt.close()
-    print(f"Feature Importance Plot 저장: {fi_plot_path}")
+    print("Feature Importance 저장 완료")
 
 
 # =====================================================
 # 7단계: XAI (LIME)
+#   - 오분류 샘플 자동 선택
+#   - Pipeline이 스케일링 처리 → 원본 데이터 전달
 # =====================================================
-def xai_lime(best_model, X_train_fs, X_test_fs, selected_features, class_names):
+def xai_lime(best_model, X_train_fs, X_test_fs, y_test, selected_features, class_names):
     print("\n[7단계] XAI (LIME)")
 
     try:
@@ -503,144 +568,144 @@ def xai_lime(best_model, X_train_fs, X_test_fs, selected_features, class_names):
             training_data=np.array(X_train_fs),
             feature_names=selected_features,
             class_names=class_names,
-            mode="classification"
+            mode="classification",
+            random_state=RANDOM_STATE
         )
 
-        sample = X_test_fs.iloc[3].values # LIME 예시
+        y_pred = best_model.predict(X_test_fs)
+        misclassified = np.where(y_pred != y_test)[0]
 
-        def predict_fn(x):
-            return best_model.predict_proba(x)
+        if len(misclassified) > 0:
+            sample_idx = misclassified[0]
+            print(f"오분류 샘플 선택 (index={sample_idx})")
+        else:
+            sample_idx = 0
+            print("오분류 샘플 없음 → 첫 번째 샘플 사용")
 
-        exp = explainer.explain_instance(sample, predict_fn)
-        lime_path = os.path.join(RESULT_DIR, "best_lime_explanation.html")
+        exp = explainer.explain_instance(
+            X_test_fs.iloc[sample_idx].values,
+            best_model.predict_proba
+        )
+        lime_path = os.path.join(RESULT_DIR, "lime_explanation.html")
         exp.save_to_file(lime_path)
-        print(f"LIME 결과 저장: {lime_path}")
+        print(f"LIME 저장 완료: {lime_path}")
 
     except Exception as e:
-        print(f"❌ LIME 실행 실패: {e}")
+        print(f"LIME 실행 실패: {e}")
 
 
 # =====================================================
-# 8단계: 알고리즘 저장 (pkl)
+# 8단계: 모델 저장 (Pipeline 1개 = scaler + model)
 # =====================================================
-def save_algorithm(best_model, scaler, selected_features):
-    print("\n[8단계] 알고리즘 저장")
-
-    model_path = os.path.join(RESULT_DIR, "best_model.pkl")
-    scaler_path = os.path.join(RESULT_DIR, "best_scaler.pkl")
-    features_path = os.path.join(RESULT_DIR, "best_features.pkl")
-
-    joblib.dump(best_model, model_path)
-    joblib.dump(scaler, scaler_path)
-    joblib.dump(selected_features, features_path)
-
-    print(f"모델 저장 완료: {model_path}")
-    print(f"스케일러 저장 완료: {scaler_path}")
-    print(f"피처 목록 저장 완료: {features_path}")
+def save_model(best_model, selected_features):
+    print("\n[8단계] 모델 저장")
+    joblib.dump(best_model,        os.path.join(RESULT_DIR, "best_model.pkl"))
+    joblib.dump(selected_features, os.path.join(RESULT_DIR, "best_features.pkl"))
+    print("저장 완료: best_model.pkl, best_features.pkl")
 
 
 # =====================================================
-# MAIN: 전체 파이프라인 실행
+# MAIN
 # =====================================================
 def main():
-    print("\n============================================")
-    print("🚀 머신러닝 파이프라인 시작")
-    print("============================================")
+    print("\n" + "=" * 60)
+    print("  머신러닝 파이프라인 시작")
+    print("=" * 60)
 
-    # 1. 데이터 불러오기
-    X, y, feature_names, class_names = data_loading()
+    # 1. 데이터 로딩
+    X, y, feature_cols, class_names = data_loading()
 
-    # 2. Train/Test 분리 (Test는 이후 과정에서 완전 분리)
+    # 2. Train / Test 분리
+    #    Test는 5, 6단계 최종 평가에만 사용
     X_train, X_test, y_train, y_test = data_split(X, y)
 
-    # 3. Feature Selection (Train 데이터만 사용)
-    selected_features = feature_selection_rfecv(X_train, y_train, min_features=5)
+    # 3. Feature Selection (Train만 사용)
+    selected_features = feature_selection(X_train, y_train, min_features=5)
+    X_train_fs = X_train[selected_features]
+    X_test_fs  = X_test[selected_features]
 
     # 4. 모델 정의
-    models = model_development()
+    models = build_models()
 
-    best_model = None
+    # 5. 학습 및 평가
+    print("\n[5단계] 모델 학습 및 평가")
+    print("  학습/튜닝: X_train (5-fold CV, MCC 기준)")
+    print("  평가:      X_test (최종 1회)")
+
+    results_list   = []
+    y_proba_base   = {}
+    y_proba_gs     = {}
+    y_proba_optuna = {}
+    best_model      = None
     best_model_name = None
-    best_mcc = -999
-    best_scaler = None
-    best_X_train_fs = None
-    best_X_test_fs = None
+    best_mcc        = -999
 
-    results_list = []
-    y_proba_base = {}
-    y_proba_tuned = {}
+    for model_name, pipeline in models.items():
+        print(f"\n{'─'*50}")
+        print(f"  {model_name}")
+        print(f"{'─'*50}")
 
-    print("\n[5단계] 기본 모델 학습 및 평가 + GridSearch 튜닝")
-
-    for model_name, model in models.items():
-
-        # 4-1. Feature Subset + Scaling (모델별)
-        X_train_fs, X_test_fs, scaler = feature_scaling(
-            X_train, X_test, selected_features, model_name
+        # Base
+        b_model, b_proba, b_metrics = evaluate_base(
+            pipeline, model_name, X_train_fs, y_train, X_test_fs, y_test
         )
+        results_list.append(b_metrics)
+        y_proba_base[model_name] = b_proba
+        if b_metrics["MCC"] > best_mcc:
+            best_mcc, best_model, best_model_name = (
+                b_metrics["MCC"], b_model, f"{model_name} (Base)"
+            )
 
-        # 5-1. 기본 모델 평가
-        base_model, y_pred_base, y_proba_base_model, mcc_base, metrics_base = model_evaluation(
-            model, X_train_fs, y_train, X_test_fs, y_test, model_name
+        # GridSearch
+        g_model, g_proba, g_metrics = evaluate_gridsearch(
+            pipeline, model_name, X_train_fs, y_train, X_test_fs, y_test
         )
+        if g_metrics is not None:
+            results_list.append(g_metrics)
+            y_proba_gs[model_name] = g_proba
+            if g_metrics["MCC"] > best_mcc:
+                best_mcc, best_model, best_model_name = (
+                    g_metrics["MCC"], g_model, f"{model_name} (GridSearch)"
+                )
 
-        results_list.append(metrics_base)
-        y_proba_base[model_name] = y_proba_base_model
-
-        # Best Model 갱신 (Base 기준)
-        if mcc_base > best_mcc:
-            best_mcc = mcc_base
-            best_model = base_model
-            best_model_name = model_name + " (Base)"
-            best_scaler = scaler
-            best_X_train_fs = X_train_fs
-            best_X_test_fs = X_test_fs
-
-        # 5-2. GridSearch 튜닝 모델 평가
-        tuned_model, _, y_proba_tuned_model, mcc_tuned, metrics_tuned = evaluate_with_gridsearch(
-            model, X_train_fs, y_train, X_test_fs, y_test, model_name
+        # Optuna
+        o_model, o_proba, o_metrics = evaluate_optuna(
+            pipeline, model_name, X_train_fs, y_train, X_test_fs, y_test, n_trials=50
         )
+        if o_metrics is not None:
+            results_list.append(o_metrics)
+            y_proba_optuna[model_name] = o_proba
+            if o_metrics["MCC"] > best_mcc:
+                best_mcc, best_model, best_model_name = (
+                    o_metrics["MCC"], o_model, f"{model_name} (Optuna)"
+                )
 
-        if metrics_tuned is not None:
-            results_list.append(metrics_tuned)
-            y_proba_tuned[model_name] = y_proba_tuned_model
+    print("\n" + "=" * 60)
+    print(f"  Best Model: {best_model_name} | MCC={best_mcc:.3f}")
+    print("=" * 60)
 
-            if mcc_tuned > best_mcc:
-                best_mcc = mcc_tuned
-                best_model = tuned_model
-                best_model_name = model_name + " (Tuned)"
-                best_scaler = scaler
-                best_X_train_fs = X_train_fs
-                best_X_test_fs = X_test_fs
-
-    print("\n============================================")
-    print(f"🏆 최종 Best Model: {best_model_name} | MCC={best_mcc:.3f}")
-    print("============================================")
-
-    # 6. 결과 저장 및 시각화
+    # 6. 결과 저장
     save_results(
         results_list=results_list,
         y_test=y_test,
         y_proba_base=y_proba_base,
-        y_proba_tuned=y_proba_tuned,
+        y_proba_gs=y_proba_gs,
+        y_proba_optuna=y_proba_optuna,
         best_model_name=best_model_name,
         best_model=best_model,
-        X_test_fs=best_X_test_fs,
+        X_test_fs=X_test_fs,
         selected_features=selected_features,
         class_names=class_names
     )
 
-    # 7. XAI (LIME)
-    xai_lime(best_model, best_X_train_fs, best_X_test_fs, selected_features, class_names)
+    # 7. XAI
+    xai_lime(best_model, X_train_fs, X_test_fs, y_test, selected_features, class_names)
 
-    # 8. 알고리즘 저장
-    save_algorithm(best_model, best_scaler, selected_features)
+    # 8. 모델 저장
+    save_model(best_model, selected_features)
 
-    print("\n🎉 전체 파이프라인 완료!")
+    print("\n전체 파이프라인 완료!")
 
 
-# =====================================================
-# MAIN 실행
-# =====================================================
 if __name__ == "__main__":
     main()
