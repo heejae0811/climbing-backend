@@ -12,7 +12,7 @@ from mediapipe.tasks.python.vision.core import image as mp_image
 # 0. 기본 설정
 # ==========================================================
 VIDEO_DIR = "./v/"
-OUTPUT_DIR = "./features_xlsx_all/"
+OUTPUT_DIR = "./features_xlsx/"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 FRAME_INTERVAL = 1  # 모든 프레임 분석
