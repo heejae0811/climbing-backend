@@ -11,15 +11,23 @@ from mediapipe.tasks.python.vision.core import image as mp_image
 # ==========================================================
 # 0. 기본 설정
 # ==========================================================
-VIDEO_DIR = "./v/"
+VIDEO_DIR = "./videos/"
 OUTPUT_DIR = "./features_xlsx/"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 FRAME_INTERVAL = 1  # 모든 프레임 분석
-VISIBILITY_MIN = 0.5  # hip landmark visibility threshold
-HIP_RECOGNITION_RATIO_MIN = 0.30  # 골반 인식률 30% 미만이면 제외
+VISIBILITY_MIN = 0.5  # landmark visibility threshold
+JOINT_RECOGNITION_RATIO_MIN = 0.30  # 각 관절 인식률 30% 미만이면 제외
 SMOOTH_WINDOW = 5  # acc/jerk 계산용 이동평균 창 (홀수 권장)
 POSE_MODEL_PATH = "./models/pose_landmarker_full.task"
+
+# 분석할 관절
+TARGET_JOINTS = {
+    "left_hip": 23,
+    "right_hip": 24,
+    "left_shoulder": 11,
+    "right_shoulder": 12
+}
 
 
 # ==========================================================
@@ -60,11 +68,6 @@ def nan_ratio(arr):
 # ==========================================================
 # 3. Kinematics 계산 함수
 # ==========================================================
-def center_point(p1, p2):
-    """두 점의 중심점 계산"""
-    return ((p1[0] + p2[0]) / 2.0, (p1[1] + p2[1]) / 2.0)
-
-
 def velocity_series(pts, dt):
     """속도 시계열 계산 (첫 프레임 속도는 0)"""
     v = [0.0]
@@ -72,7 +75,7 @@ def velocity_series(pts, dt):
         dx = pts[i][0] - pts[i - 1][0]
         dy = pts[i][1] - pts[i - 1][1]
         v.append(np.sqrt(dx ** 2 + dy ** 2) / dt)
-    return np.array(v)
+    return np.array(v, dtype=float)
 
 
 def acc_series(v, dt):
@@ -115,12 +118,50 @@ def robust_body_size_from_landmarks(lm, visibility_min):
     if len(dists) == 0:
         return np.nan
 
-    bs = float(np.mean(dists))
-    return bs
+    return float(np.mean(dists))
 
 
 # ==========================================================
-# 4. Feature Extraction
+# 4. Joint feature 계산 함수
+# ==========================================================
+def compute_joint_features(joint_xy, bs_med, dt, smooth_window, joint_name):
+    """
+    단일 관절의 x,y 좌표 시계열로부터 feature 계산
+    모든 값은 body size median으로 정규화
+    """
+    joint_v_pixel = velocity_series(joint_xy, dt)
+
+    # body size 정규화
+    joint_v = joint_v_pixel / bs_med
+    joint_v_for_diff = moving_average(joint_v, smooth_window)
+    joint_a = acc_series(joint_v_for_diff, dt)
+    joint_j = jerk_series(joint_a, dt)
+
+    # path length (픽셀 총 이동거리 / body size)
+    path_pixel = np.sum(joint_v_pixel * dt)
+    path = path_pixel / bs_med
+
+    feats = {
+        f"{joint_name}_velocity_mean": float(np.mean(joint_v)),
+        f"{joint_name}_velocity_max": float(np.max(joint_v)),
+        f"{joint_name}_velocity_sd": float(np.std(joint_v)),
+
+        f"{joint_name}_acc_mean": float(np.mean(np.abs(joint_a))),
+        f"{joint_name}_acc_max": float(np.max(np.abs(joint_a))),
+        f"{joint_name}_acc_sd": float(np.std(joint_a)),
+
+        f"{joint_name}_jerk_mean": float(np.mean(np.abs(joint_j))),
+        f"{joint_name}_jerk_max": float(np.max(np.abs(joint_j))),
+        f"{joint_name}_jerk_sd": float(np.std(joint_j)),
+
+        f"{joint_name}_path_length": float(path),
+    }
+
+    return feats
+
+
+# ==========================================================
+# 5. Feature Extraction
 # ==========================================================
 def extract_features(video_path):
     if not os.path.exists(POSE_MODEL_PATH):
@@ -133,13 +174,14 @@ def extract_features(video_path):
     dt = 1.0 / fps
 
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-    # total_time: 영상 총 길이 (초)
     total_time = frame_count / fps if fps > 0 else np.nan
 
-    hip_pts, body_sizes = [], []
-    hip_visible_flags = []
     frame_idx = 0
+
+    # 각 관절별 좌표/가시성 저장
+    joint_points = {joint_name: [] for joint_name in TARGET_JOINTS.keys()}
+    joint_visible_flags = {joint_name: [] for joint_name in TARGET_JOINTS.keys()}
+    body_sizes = []
 
     base_options = tasks.BaseOptions(model_asset_path=POSE_MODEL_PATH)
     options = vision.PoseLandmarkerOptions(
@@ -157,6 +199,7 @@ def extract_features(video_path):
             ret, frame = cap.read()
             if not ret:
                 break
+
             if frame_idx % FRAME_INTERVAL != 0:
                 frame_idx += 1
                 continue
@@ -165,93 +208,84 @@ def extract_features(video_path):
             mp_frame = mp_image.Image(image_format=mp_image.ImageFormat.SRGB, data=rgb)
             timestamp_ms = int((frame_idx / fps) * 1000)
             result = landmarker.detect_for_video(mp_frame, timestamp_ms)
+
             if result.pose_landmarks:
                 lm = result.pose_landmarks[0]
-                left_ok = lm[23].visibility >= VISIBILITY_MIN
-                right_ok = lm[24].visibility >= VISIBILITY_MIN
-                if left_ok and right_ok:
-                    hip_pts.append(center_point((lm[23].x, lm[23].y), (lm[24].x, lm[24].y)))
-                    body_sizes.append(robust_body_size_from_landmarks(lm, VISIBILITY_MIN))
-                    hip_visible_flags.append(True)
-                else:
-                    hip_pts.append((np.nan, np.nan))
-                    body_sizes.append(np.nan)
-                    hip_visible_flags.append(False)
+
+                # body size
+                body_sizes.append(robust_body_size_from_landmarks(lm, VISIBILITY_MIN))
+
+                # 각 관절 좌표 추출
+                for joint_name, joint_idx in TARGET_JOINTS.items():
+                    if lm[joint_idx].visibility >= VISIBILITY_MIN:
+                        joint_points[joint_name].append((lm[joint_idx].x, lm[joint_idx].y))
+                        joint_visible_flags[joint_name].append(True)
+                    else:
+                        joint_points[joint_name].append((np.nan, np.nan))
+                        joint_visible_flags[joint_name].append(False)
+
             else:
-                hip_pts.append((np.nan, np.nan))
                 body_sizes.append(np.nan)
-                hip_visible_flags.append(False)
+                for joint_name in TARGET_JOINTS.keys():
+                    joint_points[joint_name].append((np.nan, np.nan))
+                    joint_visible_flags[joint_name].append(False)
+
             frame_idx += 1
 
     cap.release()
 
-    hip_x = np.array([p[0] for p in hip_pts])
-    hip_y = np.array([p[1] for p in hip_pts])
-    bs = np.array(body_sizes)
-
-    # Hip recognition ratio 체크 (visibility 기반, 30% 미만이면 제외)
-    hip_recognition_ratio = float(np.mean(hip_visible_flags)) if hip_visible_flags else 0.0
-    if hip_recognition_ratio < HIP_RECOGNITION_RATIO_MIN:
-        print(f"❌ Hip 인식률 {hip_recognition_ratio:.2f} → {os.path.basename(video_path)}")
-        return None
-
-    # Body size median 계산 (보간 전 원본 유효 값으로)
+    # body size median 계산
+    bs = np.array(body_sizes, dtype=float)
     valid_bs = bs[np.isfinite(bs)]
+
     if valid_bs.size == 0:
         print(f"❌ BodySize 유효값 없음 → {os.path.basename(video_path)}")
         return None
+
     bs_med = float(np.median(valid_bs))
     if not np.isfinite(bs_med) or bs_med <= 1e-6:
         print(f"❌ BodySize 비정상 → {os.path.basename(video_path)}")
         return None
-
-    # Missing data 보간
-    hip_x = fill_missing(hip_x)
-    hip_y = fill_missing(hip_y)
-    bs = fill_missing(bs)
-
-    hip_xy = list(zip(hip_x, hip_y))
-
-    # 픽셀 단위 속도 계산
-    hip_v_pixel = velocity_series(hip_xy, dt)
-
-    # Body size로 정규화
-    hip_v = hip_v_pixel / bs_med
-    hip_v_for_diff = moving_average(hip_v, SMOOTH_WINDOW)
-    hip_a = acc_series(hip_v_for_diff, dt)
-    hip_j = jerk_series(hip_a, dt)
-
-    # Path length: 픽셀 단위 총 이동거리를 body size로 정규화
-    path_pixel = np.sum(hip_v_pixel * dt)
-    path = path_pixel / bs_med
 
     feats = {
         "id": extract_id_and_label(video_path)[0],
         "label": extract_id_and_label(video_path)[1],
         "total_time": total_time,
         "body_size_median": bs_med,
-
-        # Fluency (유창성) - 모두 body_size로 정규화됨
-        "fluency_hip_velocity_mean": float(np.mean(hip_v)),
-        "fluency_hip_velocity_max": float(np.max(hip_v)),
-        "fluency_hip_acc_mean": float(np.mean(np.abs(hip_a))),
-        "fluency_hip_acc_max": float(np.max(np.abs(hip_a))),
-        "fluency_hip_jerk_mean": float(np.mean(np.abs(hip_j))),
-        "fluency_hip_jerk_max": float(np.max(np.abs(hip_j))),
-        "fluency_hip_jerk_rms": float(np.sqrt(np.mean(hip_j ** 2))),
-        "fluency_hip_path_length": float(path),
-
-        # Stability (안정성) - 모두 body_size로 정규화됨
-        "stability_hip_velocity_sd": float(np.std(hip_v)),
-        "stability_hip_acc_sd": float(np.std(hip_a)),
-        "stability_hip_jerk_sd": float(np.std(hip_j)),
     }
+
+    # 각 관절별 인식률 확인 및 feature 계산
+    for joint_name in TARGET_JOINTS.keys():
+        visible_flags = joint_visible_flags[joint_name]
+        recognition_ratio = float(np.mean(visible_flags)) if visible_flags else 0.0
+
+        if recognition_ratio < JOINT_RECOGNITION_RATIO_MIN:
+            print(f"❌ {joint_name} 인식률 {recognition_ratio:.2f} → {os.path.basename(video_path)}")
+            return None
+
+        joint_x = np.array([p[0] for p in joint_points[joint_name]], dtype=float)
+        joint_y = np.array([p[1] for p in joint_points[joint_name]], dtype=float)
+
+        joint_x = fill_missing(joint_x)
+        joint_y = fill_missing(joint_y)
+
+        joint_xy = list(zip(joint_x, joint_y))
+
+        joint_feats = compute_joint_features(
+            joint_xy=joint_xy,
+            bs_med=bs_med,
+            dt=dt,
+            smooth_window=SMOOTH_WINDOW,
+            joint_name=joint_name
+        )
+
+        feats.update(joint_feats)
 
     return feats
 
 
 # ==========================================================
-# 5. MAIN
+# 6. MAIN
 # ==========================================================
 def main():
     files = glob.glob(os.path.join(VIDEO_DIR, "*.mp4")) + \
@@ -284,7 +318,7 @@ def main():
         success_count += 1
 
     print("=" * 60)
-    print(f"🎉 분석 완료!")
+    print("🎉 분석 완료!")
     print(f"   성공: {success_count}개 | 실패: {fail_count}개")
     print("=" * 60)
 
