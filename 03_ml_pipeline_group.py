@@ -10,7 +10,6 @@ from matplotlib import pyplot as plt
 from sklearn.model_selection import (
     GroupShuffleSplit,
     StratifiedGroupKFold,
-    GridSearchCV
 )
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
@@ -188,40 +187,40 @@ def build_models():
     print("\n[4단계] 모델 정의 (10개, Pipeline 기반)")
 
     models = {
-        "LR": Pipeline([
+        "Logistic Regression": Pipeline([
             ("scaler", StandardScaler()),
             ("model", LogisticRegression(
                 max_iter=1000, C=1.0, solver="lbfgs",
                 random_state=RANDOM_STATE
             ))
         ]),
-        "KNN": Pipeline([
+        "K-Nearest Neighbors": Pipeline([
             ("scaler", StandardScaler()),
             ("model", KNeighborsClassifier(
                 n_neighbors=7, weights="distance", metric="euclidean"
             ))
         ]),
-        "SVM": Pipeline([
+        "Support Vector Machine": Pipeline([
             ("scaler", StandardScaler()),
             ("model", SVC(
                 C=1.0, kernel="rbf", gamma="scale",
                 probability=True, random_state=RANDOM_STATE
             ))
         ]),
-        "DT": Pipeline([
+        "Decision Tree": Pipeline([
             ("model", DecisionTreeClassifier(
                 max_depth=5, min_samples_split=10, min_samples_leaf=5,
                 random_state=RANDOM_STATE
             ))
         ]),
-        "RF": Pipeline([
+        "Random Forest": Pipeline([
             ("model", RandomForestClassifier(
                 n_estimators=300, max_depth=10,
                 min_samples_split=10, min_samples_leaf=5,
                 max_features="sqrt", random_state=RANDOM_STATE, n_jobs=-1
             ))
         ]),
-        "GB": Pipeline([
+        "Gradient Boosting": Pipeline([
             ("model", GradientBoostingClassifier(
                 n_estimators=200, learning_rate=0.05,
                 max_depth=4, random_state=RANDOM_STATE
@@ -263,59 +262,6 @@ def build_models():
 
 
 # =====================================================
-# GridSearch 파라미터 (F1 기준)
-# =====================================================
-def get_gridsearch_params(model_name):
-    grids = {
-        "LR": {
-            "model__C": [0.01, 0.1, 1, 10]
-        },
-        "KNN": {
-            "model__n_neighbors": [5, 7, 9, 11, 13],
-            "model__weights":     ["uniform", "distance"]
-        },
-        "SVM": {
-            "model__C":     [0.1, 1, 10],
-            "model__gamma": ["scale", "auto"]
-        },
-        "DT": {
-            "model__max_depth":        [3, 4, 5],
-            "model__min_samples_leaf": [5, 10, 15]
-        },
-        "RF": {
-            "model__n_estimators":     [200, 300],
-            "model__max_depth":        [5, 7, 10],
-            "model__min_samples_leaf": [5, 10]
-        },
-        "GB": {
-            "model__n_estimators":  [100, 200],
-            "model__learning_rate": [0.05, 0.1],
-            "model__max_depth":     [3, 4, 5]
-        },
-        "AdaBoost": {
-            "model__n_estimators":  [100, 200, 300],
-            "model__learning_rate": [0.5, 1.0]
-        },
-        "LightGBM": {
-            "model__num_leaves":        [10, 15, 20],
-            "model__learning_rate":     [0.01, 0.05, 0.1],
-            "model__min_child_samples": [20, 30]
-        },
-        "XGBoost": {
-            "model__max_depth":     [3, 4, 5],
-            "model__learning_rate": [0.01, 0.05, 0.1],
-            "model__subsample":     [0.8, 1.0]
-        },
-        "CatBoost": {
-            "model__depth":         [3, 4, 5],
-            "model__learning_rate": [0.01, 0.05, 0.1],
-            "model__l2_leaf_reg":   [3, 5, 10]
-        }
-    }
-    return grids.get(model_name, None)
-
-
-# =====================================================
 # 평가 지표
 # =====================================================
 def compute_metrics(model_label, y_test, y_pred, y_proba):
@@ -324,72 +270,39 @@ def compute_metrics(model_label, y_test, y_pred, y_proba):
 
     return {
         "Model":             model_label,
-        "Accuracy":          (y_pred == y_test).mean(),
-        "Precision":         precision_score(y_test, y_pred, zero_division=0),
-        "Recall":            recall_score(y_test, y_pred, zero_division=0),
-        "F1":                f1_score(y_test, y_pred, zero_division=0),
-        "Specificity":       tn / (tn + fp) if (tn + fp) > 0 else 0,
-        "Sensitivity":       tp / (tp + fn) if (tp + fn) > 0 else 0,
-        "Balanced_Accuracy": balanced_accuracy_score(y_test, y_pred),
-        "MCC":               matthews_corrcoef(y_test, y_pred),
-        "AUC":               roc_auc_score(y_test, y_proba)
+        "Accuracy":          round((y_pred == y_test).mean(), 2),
+        "Precision":         round(precision_score(y_test, y_pred, zero_division=0), 2),
+        "Recall":            round(recall_score(y_test, y_pred, zero_division=0), 2),
+        "F1":                round(f1_score(y_test, y_pred, zero_division=0), 2),
+        "Specificity":       round(tn / (tn + fp) if (tn + fp) > 0 else 0, 2),
+        "Sensitivity":       round(tp / (tp + fn) if (tp + fn) > 0 else 0, 2),
+        "Balanced_Accuracy": round(balanced_accuracy_score(y_test, y_pred), 2),
+        "MCC":               round(matthews_corrcoef(y_test, y_pred), 2),
+        "AUC":               round(roc_auc_score(y_test, y_proba), 2)
     }
 
 
 # =====================================================
-# 5-1: Base 평가
+# 5단계: 모델 학습 및 평가
 # =====================================================
-def evaluate_base(pipeline, model_name, X_train, y_train, X_test, y_test):
+def evaluate_model(pipeline, model_name, X_train, y_train, X_test, y_test):
     model = clone(pipeline)
     model.fit(X_train, y_train)
 
     y_pred  = model.predict(X_test)
     y_proba = model.predict_proba(X_test)[:, 1]
-    metrics = compute_metrics(f"{model_name} (Base)", y_test, y_pred, y_proba)
+    metrics = compute_metrics(model_name, y_test, y_pred, y_proba)
 
-    print(f"  [Base]       Acc={metrics['Accuracy']:.3f} | "
-          f"F1={metrics['F1']:.3f} | MCC={metrics['MCC']:.3f} | AUC={metrics['AUC']:.3f}")
+    print(f"  Acc={metrics['Accuracy']:.2f} | "
+          f"F1={metrics['F1']:.2f} | MCC={metrics['MCC']:.2f} | AUC={metrics['AUC']:.2f}")
 
     return model, y_proba, metrics
 
 
 # =====================================================
-# 5-2: GridSearch 평가 (Group CV, F1 기준)
-# =====================================================
-def evaluate_gridsearch(pipeline, model_name, X_train, y_train, groups_train, X_test, y_test):
-    param_grid = get_gridsearch_params(model_name)
-    if param_grid is None:
-        return None, None, None
-
-    cv = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
-
-    grid = GridSearchCV(
-        estimator=clone(pipeline),
-        param_grid=param_grid,
-        cv=cv,
-        scoring="f1",
-        refit=True,
-        n_jobs=-1
-    )
-    grid.fit(X_train, y_train, groups=groups_train)
-
-    best_model = grid.best_estimator_
-    print(f"  [GridSearch] Best: {grid.best_params_}")
-
-    y_pred  = best_model.predict(X_test)
-    y_proba = best_model.predict_proba(X_test)[:, 1]
-    metrics = compute_metrics(f"{model_name} (GridSearch)", y_test, y_pred, y_proba)
-
-    print(f"  [GridSearch] Acc={metrics['Accuracy']:.3f} | "
-          f"F1={metrics['F1']:.3f} | MCC={metrics['MCC']:.3f} | AUC={metrics['AUC']:.3f}")
-
-    return best_model, y_proba, metrics
-
-
-# =====================================================
 # 6단계: 결과 저장
 # =====================================================
-def save_results(results_list, y_test, y_proba_base, y_proba_gs,
+def save_results(results_list, y_test, y_proba_dict,
                  best_model_name, best_model, X_test, selected_features, class_names):
     print("\n[6단계] 결과 저장 및 시각화")
 
@@ -411,26 +324,20 @@ def save_results(results_list, y_test, y_proba_base, y_proba_gs,
     plt.savefig(os.path.join(RESULT_DIR, "best_confusion_matrix.png"), dpi=300)
     plt.close()
 
-    # 이미지: ROC Curve (Base / GridSearch)
-    for label, y_proba_dict, fname in [
-        ("Base Models",       y_proba_base, "roc_base.png"),
-        ("GridSearch Models", y_proba_gs,   "roc_gridsearch.png"),
-    ]:
-        if not y_proba_dict:
-            continue
-        plt.figure(figsize=(8, 6))
-        for name, y_proba in y_proba_dict.items():
-            fpr, tpr, _ = roc_curve(y_test, y_proba)
-            plt.plot(fpr, tpr, lw=2, label=f"{name} (AUC={auc(fpr, tpr):.3f})")
-        plt.plot([0, 1], [0, 1], "k--", label="Random")
-        plt.xlabel("False Positive Rate")
-        plt.ylabel("True Positive Rate")
-        plt.title(f"ROC Curve — {label}")
-        plt.legend(loc="lower right", fontsize=8)
-        plt.grid(alpha=0.3)
-        plt.tight_layout()
-        plt.savefig(os.path.join(RESULT_DIR, fname), dpi=300)
-        plt.close()
+    # 이미지: ROC Curve
+    plt.figure(figsize=(8, 6))
+    for name, y_proba in y_proba_dict.items():
+        fpr, tpr, _ = roc_curve(y_test, y_proba)
+        plt.plot(fpr, tpr, lw=2, label=f"{name} (AUC={auc(fpr, tpr):.2f})")
+    plt.plot([0, 1], [0, 1], "k--", label="Random")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("ROC Curve")
+    plt.legend(loc="lower right", fontsize=8)
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(RESULT_DIR, "roc_curve.png"), dpi=300)
+    plt.close()
 
     # 엑셀 + 이미지: Permutation Feature Importance (F1 기준)
     perm = permutation_importance(
@@ -440,8 +347,8 @@ def save_results(results_list, y_test, y_proba_base, y_proba_gs,
     )
     df_fi = pd.DataFrame({
         "Feature":    selected_features,
-        "Importance": perm.importances_mean,
-        "Std":        perm.importances_std
+        "Importance": perm.importances_mean.round(2),
+        "Std":        perm.importances_std.round(2)
     }).sort_values("Importance", ascending=False)
 
     df_fi.to_excel(os.path.join(RESULT_DIR, "feature_importance.xlsx"), index=False)
@@ -476,15 +383,25 @@ def xai_lime(best_model, X_train, X_test, y_test, selected_features, class_names
 
         y_pred        = best_model.predict(X_test)
         misclassified = np.where(y_pred != y_test)[0]
-        sample_idx    = misclassified[15] if len(misclassified) > 0 else 0
+        sample_idx    = misclassified[4] if len(misclassified) > 0 else 0
 
         exp = explainer.explain_instance(
             X_test.iloc[sample_idx].values,
             best_model.predict_proba,
             num_samples=5000
         )
+
+        # 1) HTML 저장
         exp.save_to_file(os.path.join(RESULT_DIR, "lime_explanation.html"))
-        print("LIME 저장 완료")
+
+        # 2) PNG 이미지 저장
+        fig = exp.as_pyplot_figure()
+        fig.tight_layout()
+        fig.savefig(os.path.join(RESULT_DIR, "lime_explanation.png"),
+                    dpi=300, bbox_inches="tight")
+        plt.close(fig)
+
+        print("LIME HTML + PNG 저장 완료")
 
     except Exception as e:
         print(f"LIME 실행 실패: {e}")
@@ -492,10 +409,17 @@ def xai_lime(best_model, X_train, X_test, y_test, selected_features, class_names
 
 # =====================================================
 # 7-추가: SHAP
-#   - Tree 계열 (RF, GB, LGBM, XGB, CatBoost): TreeExplainer
-#   - 비Tree 계열 (LR, KNN, SVM, AdaBoost):    KernelExplainer
+#   - Tree 계열 (RF, GB, LGBM, XGB, CatBoost): TreeExplainer  → shap_values.values shape: (n, f, n_class)
+#   - 비Tree 계열 (LR, KNN, SVM, AdaBoost):    KernelExplainer → shap_values list[n_class] of (n, f)
+#
+#   출력:
+#     ① shap_bar.png          — 전체 평균 |SHAP| bar (기존)
+#     ② shap_beeswarm.png     — beeswarm (기존)
+#     ③ shap_waterfall_*.png  — 샘플 0 waterfall (기존)
+#     ④ shap_classwise_bar.png — 논문 Figure 6 스타일: 클래스별 Mean |SHAP| 가로 막대
+#     ⑤ shap_importance.xlsx  — feature × class Mean |SHAP| 테이블
 # =====================================================
-def xai_shap(best_model, best_model_name, X_train, X_test, selected_features):
+def xai_shap(best_model, best_model_name, X_train, X_test, selected_features, class_names):
     print("\n[7-추가] XAI (SHAP)")
 
     try:
@@ -505,8 +429,6 @@ def xai_shap(best_model, best_model_name, X_train, X_test, selected_features):
         has_scaler = "scaler" in best_model.named_steps
         model_step = best_model.named_steps["model"]
 
-        # AdaBoost는 내부적으로 트리를 쓰지만 TreeExplainer 미지원
-        # → KernelExplainer로 처리
         tree_model_names = {
             "DecisionTreeClassifier",
             "RandomForestClassifier",
@@ -518,22 +440,29 @@ def xai_shap(best_model, best_model_name, X_train, X_test, selected_features):
         }
         is_tree_model = model_step.__class__.__name__ in tree_model_names
 
+        # ── SHAP 값 계산 ──────────────────────────────────────────
+        # shap_vals_per_class : list of ndarray (n_samples, n_features), 길이 = n_classes
         if is_tree_model:
             print("  SHAP mode: TreeExplainer")
             explainer   = shap.TreeExplainer(model_step)
-            shap_values = explainer(X_explain)
+            shap_obj    = explainer(X_explain)           # Explanation object
 
-            if len(shap_values.values.shape) == 3:
+            raw = shap_obj.values                        # (n, f) or (n, f, c)
+            if raw.ndim == 3:
+                n_classes = raw.shape[2]
+                shap_vals_per_class = [raw[:, :, c] for c in range(n_classes)]
+                # 단일 클래스 플롯용 (class 1)
                 values_for_plot = shap.Explanation(
-                    values=shap_values.values[:, :, 1],
-                    base_values=shap_values.base_values[:, 1]
-                        if np.ndim(shap_values.base_values) > 1
-                        else shap_values.base_values,
-                    data=shap_values.data,
-                    feature_names=selected_features
+                    values     = raw[:, :, 1],
+                    base_values= shap_obj.base_values[:, 1]
+                                 if np.ndim(shap_obj.base_values) > 1
+                                 else shap_obj.base_values,
+                    data       = shap_obj.data,
+                    feature_names = selected_features
                 )
             else:
-                values_for_plot = shap_values
+                shap_vals_per_class = [raw]
+                values_for_plot = shap_obj
 
         else:
             print("  SHAP mode: KernelExplainer")
@@ -551,31 +480,39 @@ def xai_shap(best_model, best_model_name, X_train, X_test, selected_features):
                 X_explain_trans    = X_explain.copy()
 
             explainer   = shap.KernelExplainer(model_step.predict_proba, X_background_trans)
-            shap_values = explainer.shap_values(X_explain_trans, nsamples=100)
+            raw_sv      = explainer.shap_values(X_explain_trans, nsamples=100)
 
-            if isinstance(shap_values, list):
-                values     = shap_values[1]
+            if isinstance(raw_sv, list):
+                # raw_sv[c] : (n, f)
+                shap_vals_per_class = raw_sv
+                n_classes = len(raw_sv)
+                values     = raw_sv[1]
                 base_value = explainer.expected_value[1] \
                     if isinstance(explainer.expected_value, (list, np.ndarray)) \
                     else explainer.expected_value
             else:
-                shap_values_np = np.array(shap_values)
-                if shap_values_np.ndim == 3:
-                    values     = shap_values_np[:, :, 1]
+                sv_np = np.array(raw_sv)
+                if sv_np.ndim == 3:
+                    n_classes = sv_np.shape[2]
+                    shap_vals_per_class = [sv_np[:, :, c] for c in range(n_classes)]
+                    values     = sv_np[:, :, 1]
                     base_value = explainer.expected_value[1] \
                         if isinstance(explainer.expected_value, (list, np.ndarray)) \
                         else explainer.expected_value
                 else:
-                    values     = shap_values_np
+                    shap_vals_per_class = [sv_np]
+                    n_classes = 1
+                    values     = sv_np
                     base_value = explainer.expected_value
 
             values_for_plot = shap.Explanation(
-                values=values,
-                base_values=np.repeat(base_value, X_explain_trans.shape[0]),
-                data=X_explain_trans.values,
-                feature_names=selected_features
+                values      = values,
+                base_values = np.repeat(base_value, X_explain_trans.shape[0]),
+                data        = X_explain_trans.values,
+                feature_names = selected_features
             )
 
+        # ── ① ~ ③ 기존 SHAP 플롯 저장 ──────────────────────────
         for plot_fn, fname in [
             (lambda: shap.plots.bar(values_for_plot, show=False),          "shap_bar.png"),
             (lambda: shap.plots.beeswarm(values_for_plot, show=False),     "shap_beeswarm.png"),
@@ -587,12 +524,85 @@ def xai_shap(best_model, best_model_name, X_train, X_test, selected_features):
             plt.savefig(os.path.join(RESULT_DIR, fname), dpi=300, bbox_inches="tight")
             plt.close()
 
-        pd.DataFrame({
-            "Feature":     selected_features,
-            "MeanAbsSHAP": np.abs(values_for_plot.values).mean(axis=0)
-        }).sort_values("MeanAbsSHAP", ascending=False).to_excel(
-            os.path.join(RESULT_DIR, "shap_importance.xlsx"), index=False
+        # ── ④ 논문 Figure 6 스타일: 클래스별 Mean |SHAP| bar ────
+        n_classes   = len(shap_vals_per_class)
+        n_cls_avail = min(n_classes, len(class_names))
+
+        # Mean |SHAP| per feature per class  →  shape (n_features, n_classes)
+        mean_abs = np.column_stack([
+            np.abs(shap_vals_per_class[c]).mean(axis=0).round(2)
+            for c in range(n_cls_avail)
+        ])                                              # (n_features, n_cls_avail)
+
+        # 전체 클래스 평균으로 피처 정렬 (내림차순)
+        overall_mean  = mean_abs.mean(axis=1)
+        sort_idx      = np.argsort(overall_mean)        # ascending → invert_yaxis
+        feat_sorted   = [selected_features[i] for i in sort_idx]
+        mean_sorted   = mean_abs[sort_idx]              # (n_features, n_cls_avail)
+
+        # 색상: 논문과 유사하게 파랑/핑크/보라 계열
+        bar_colors = ["#4C72B0", "#DD8452", "#55A868", "#C44E52",
+                      "#8172B2", "#937860"][:n_cls_avail]
+
+        y_pos    = np.arange(len(feat_sorted))
+        bar_h    = 0.22
+        offsets  = np.linspace(-(n_cls_avail - 1) / 2,
+                               (n_cls_avail - 1) / 2,
+                               n_cls_avail) * bar_h
+
+        fig, ax = plt.subplots(figsize=(9, max(4, len(feat_sorted) * 0.55)))
+
+        for ci in range(n_cls_avail):
+            bars = ax.barh(
+                y_pos + offsets[ci],
+                mean_sorted[:, ci],
+                height=bar_h,
+                color=bar_colors[ci],
+                label=class_names[ci],
+                edgecolor="white",
+                linewidth=0.4
+            )
+            # 값 레이블
+            for bar, val in zip(bars, mean_sorted[:, ci]):
+                if val > 0:
+                    ax.text(
+                        val + mean_abs.max() * 0.01,
+                        bar.get_y() + bar.get_height() / 2,
+                        f"{val:.2f}",
+                        va="center", ha="left",
+                        fontsize=7.5
+                    )
+
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(feat_sorted, fontsize=9)
+        ax.invert_yaxis()
+        ax.set_xlabel("Mean (|SHAP value|)", fontsize=10)
+        ax.set_title(
+            f"Class-wise SHAP Feature Importance — {best_model_name}",
+            fontsize=11, pad=10
         )
+        ax.legend(title="Class", fontsize=8, title_fontsize=8,
+                  loc="lower right")
+        ax.grid(axis="x", alpha=0.3, linestyle="--")
+        ax.spines[["top", "right"]].set_visible(False)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(RESULT_DIR, "shap_classwise_bar.png"),
+                    dpi=300, bbox_inches="tight")
+        plt.close()
+        print("  shap_classwise_bar.png 저장 완료")
+
+        # ── ⑤ 엑셀: feature × class Mean |SHAP| ────────────────
+        df_shap = pd.DataFrame(
+            mean_abs,
+            index=selected_features,
+            columns=[f"MeanAbsSHAP_{cn}" for cn in class_names[:n_cls_avail]]
+        )
+        df_shap.insert(0, "Feature", selected_features)
+        df_shap["MeanAbsSHAP_Overall"] = overall_mean.round(2)
+        df_shap = df_shap.sort_values("MeanAbsSHAP_Overall", ascending=False)
+        df_shap.to_excel(os.path.join(RESULT_DIR, "shap_importance.xlsx"), index=False)
+
         print("SHAP 저장 완료")
 
     except Exception as e:
@@ -631,41 +641,34 @@ def main():
 
     print("\n[5단계] 모델 학습 및 평가")
     print(f"  사용 Feature: {len(selected_features)}개")
-    print("  GridSearch 기준: F1")
 
     results_list = []
-    y_proba_base, y_proba_gs = {}, {}
+    y_proba_dict = {}
     best_model, best_model_name, best_f1 = None, None, -999
 
     for model_name, pipeline in models.items():
         print(f"\n{'─'*50}\n  {model_name}\n{'─'*50}")
 
-        b_model, b_proba, b_metrics = evaluate_base(
+        trained_model, y_proba, metrics = evaluate_model(
             pipeline, model_name, X_train_fs, y_train, X_test_fs, y_test
         )
-        results_list.append(b_metrics)
-        y_proba_base[model_name] = b_proba
-        if b_metrics["F1"] > best_f1:
-            best_f1, best_model, best_model_name = b_metrics["F1"], b_model, f"{model_name} (Base)"
+        results_list.append(metrics)
+        y_proba_dict[model_name] = y_proba
 
-        g_model, g_proba, g_metrics = evaluate_gridsearch(
-            pipeline, model_name, X_train_fs, y_train, groups_train, X_test_fs, y_test
-        )
-        if g_metrics is not None:
-            results_list.append(g_metrics)
-            y_proba_gs[model_name] = g_proba
-            if g_metrics["F1"] > best_f1:
-                best_f1, best_model, best_model_name = g_metrics["F1"], g_model, f"{model_name} (GridSearch)"
+        if metrics["F1"] > best_f1:
+            best_f1        = metrics["F1"]
+            best_model     = trained_model
+            best_model_name = model_name
 
     print("\n" + "=" * 60)
-    print(f"  Best Model: {best_model_name} | F1={best_f1:.3f}")
+    print(f"  Best Model: {best_model_name} | F1={best_f1:.2f}")
     print("=" * 60)
 
-    save_results(results_list, y_test, y_proba_base, y_proba_gs,
+    save_results(results_list, y_test, y_proba_dict,
                  best_model_name, best_model, X_test_fs, selected_features, class_names)
 
     xai_lime(best_model, X_train_fs, X_test_fs, y_test, selected_features, class_names)
-    xai_shap(best_model, best_model_name, X_train_fs, X_test_fs, selected_features)
+    xai_shap(best_model, best_model_name, X_train_fs, X_test_fs, selected_features, class_names)
 
     save_model(best_model, selected_features)
 
