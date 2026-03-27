@@ -11,17 +11,16 @@ from mediapipe.tasks.python.vision.core import image as mp_image
 # ==========================================================
 # 0. 기본 설정
 # ==========================================================
-VIDEO_DIR = "./v/"
+VIDEO_DIR = "./videos/"
 OUTPUT_DIR = "./features_xlsx/"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-FRAME_INTERVAL = 1  # 모든 프레임 분석
-VISIBILITY_MIN = 0.5  # landmark visibility threshold
-JOINT_RECOGNITION_RATIO_MIN = 0.30  # 각 관절 인식률 30% 미만이면 제외
-SMOOTH_WINDOW = 5  # acc/jerk 계산용 이동평균 창 (홀수 권장)
+FRAME_INTERVAL = 1
+VISIBILITY_MIN = 0.5
+JOINT_RECOGNITION_RATIO_MIN = 0.30
+SMOOTH_WINDOW = 5
 POSE_MODEL_PATH = "./models/pose_landmarker_full.task"
 
-# 분석할 관절
 TARGET_JOINTS = {
     "left_hip": 23,
     "right_hip": 24,
@@ -37,11 +36,9 @@ def extract_id_and_label(video_path):
     fname = os.path.basename(video_path)
     stem = os.path.splitext(fname)[0]
 
-    # Label 추출 (언더바 사이의 숫자)
     m = re.search(r'_(\d)_', stem)
     label = int(m.group(1)) if m else None
 
-    # ID 생성: 앞 숫자 + "_" + label
     parts = stem.split('_')
     if len(parts) >= 1 and label is not None:
         video_id = f"{parts[0]}_{label}"
@@ -55,41 +52,15 @@ def extract_id_and_label(video_path):
 # 2. Missing 처리
 # ==========================================================
 def fill_missing(arr):
-    """보간 후 forward/backward fill로 완전히 채우기"""
     s = pd.Series(arr, dtype=float)
     s = s.interpolate(limit_direction="both").ffill().bfill()
     return s.to_numpy()
 
 
-def nan_ratio(arr):
-    return float(np.mean(np.isnan(np.asarray(arr, dtype=float))))
-
-
 # ==========================================================
-# 3. Kinematics 계산 함수
+# 3. 기본 계산 함수
 # ==========================================================
-def velocity_series(pts, dt):
-    """속도 시계열 계산 (첫 프레임 속도는 0)"""
-    v = [0.0]
-    for i in range(1, len(pts)):
-        dx = pts[i][0] - pts[i - 1][0]
-        dy = pts[i][1] - pts[i - 1][1]
-        v.append(np.sqrt(dx ** 2 + dy ** 2) / dt)
-    return np.array(v, dtype=float)
-
-
-def acc_series(v, dt):
-    """가속도 계산"""
-    return np.gradient(v) / dt
-
-
-def jerk_series(a, dt):
-    """저크 계산"""
-    return np.gradient(a) / dt
-
-
 def moving_average(arr, window):
-    """간단 이동평균 (창이 크면 더 부드럽게)"""
     if window <= 1:
         return np.asarray(arr, dtype=float)
     arr = np.asarray(arr, dtype=float)
@@ -99,8 +70,24 @@ def moving_average(arr, window):
     return np.convolve(arr, kernel, mode="same")
 
 
+def compute_diff(arr, dt):
+    arr = np.asarray(arr, dtype=float)
+    if len(arr) < 2:
+        return np.zeros_like(arr)
+    return np.gradient(arr) / dt
+
+
+def compute_abs_stats(arr, prefix):
+    arr = np.asarray(arr, dtype=float)
+    abs_arr = np.abs(arr)
+    return {
+        f"{prefix}_mean": float(np.mean(abs_arr)),
+        f"{prefix}_max": float(np.max(abs_arr)),
+        f"{prefix}_sd": float(np.std(abs_arr)),
+    }
+
+
 def robust_body_size_from_landmarks(lm, visibility_min):
-    """Robust한 body size 계산 - 어깨폭/골반폭만 사용, visibility 기준 적용"""
     def dist(i, j):
         dx = lm[i].x - lm[j].x
         dy = lm[i].y - lm[j].y
@@ -121,47 +108,123 @@ def robust_body_size_from_landmarks(lm, visibility_min):
     return float(np.mean(dists))
 
 
+def compute_path_length(x, y):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if len(x) < 2:
+        return 0.0
+    dx = np.diff(x)
+    dy = np.diff(y)
+    return float(np.sum(np.sqrt(dx ** 2 + dy ** 2)))
+
+
+def compute_displacement(x, y):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if len(x) == 0:
+        return 0.0
+    dx = x[-1] - x[0]
+    dy = y[-1] - y[0]
+    return float(np.sqrt(dx ** 2 + dy ** 2))
+
+
 # ==========================================================
-# 4. Joint feature 계산 함수
+# 4. 개별 관절 feature 계산
 # ==========================================================
-def compute_joint_features(joint_xy, bs_med, dt, smooth_window, joint_name):
+def compute_joint_features(joint_x, joint_y, bs_med, dt, smooth_window, joint_name):
     """
-    단일 관절의 x,y 좌표 시계열로부터 feature 계산
-    모든 값은 body size median으로 정규화
+    단일 관절의 x,y 좌표 시계열에서
+    velocity / acc / jerk / path_efficiency / vertical_efficiency만 추출
     """
-    joint_v_pixel = velocity_series(joint_xy, dt)
 
-    # body size 정규화
-    joint_v = joint_v_pixel / bs_med
-    joint_v_for_diff = moving_average(joint_v, smooth_window)
-    joint_a = acc_series(joint_v_for_diff, dt)
-    joint_j = jerk_series(joint_a, dt)
+    joint_x = np.asarray(joint_x, dtype=float)
+    joint_y = np.asarray(joint_y, dtype=float)
 
-    # path length (픽셀 총 이동거리 / body size)
-    path_pixel = np.sum(joint_v_pixel * dt)
-    path = path_pixel / bs_med
+    # 시작점 기준 정렬 + body size 정규화
+    x_rel = (joint_x - joint_x[0]) / bs_med
+    y_rel = (joint_y - joint_y[0]) / bs_med
 
-    feats = {
-        f"{joint_name}_velocity_mean": float(np.mean(joint_v)),
-        f"{joint_name}_velocity_max": float(np.max(joint_v)),
-        f"{joint_name}_velocity_sd": float(np.std(joint_v)),
+    dx = np.diff(x_rel, prepend=x_rel[0])
+    dy = np.diff(y_rel, prepend=y_rel[0])
 
-        f"{joint_name}_acc_mean": float(np.mean(np.abs(joint_a))),
-        f"{joint_name}_acc_max": float(np.max(np.abs(joint_a))),
-        f"{joint_name}_acc_sd": float(np.std(joint_a)),
+    dx_s = moving_average(dx, smooth_window)
+    dy_s = moving_average(dy, smooth_window)
 
-        f"{joint_name}_jerk_mean": float(np.mean(np.abs(joint_j))),
-        f"{joint_name}_jerk_max": float(np.max(np.abs(joint_j))),
-        f"{joint_name}_jerk_sd": float(np.std(joint_j)),
+    velocity = np.sqrt(dx_s ** 2 + dy_s ** 2) / dt
+    velocity_s = moving_average(velocity, smooth_window)
 
-        f"{joint_name}_path_length": float(path),
-    }
+    acc = compute_diff(velocity_s, dt)
+    jerk = compute_diff(acc, dt)
+
+    path_length = compute_path_length(x_rel, y_rel)
+    straight_dist = compute_displacement(x_rel, y_rel)
+    path_efficiency = straight_dist / path_length if path_length > 1e-8 else 0.0
+
+    vertical_gain = y_rel[-1] - y_rel[0]
+    vertical_efficiency = np.abs(vertical_gain) / path_length if path_length > 1e-8 else 0.0
+
+    feats = {}
+    feats.update(compute_abs_stats(velocity, f"{joint_name}_velocity"))
+    feats.update(compute_abs_stats(acc, f"{joint_name}_acc"))
+    feats.update(compute_abs_stats(jerk, f"{joint_name}_jerk"))
+
+    feats[f"{joint_name}_path_efficiency"] = float(path_efficiency)
+    feats[f"{joint_name}_vertical_efficiency"] = float(vertical_efficiency)
 
     return feats
 
 
 # ==========================================================
-# 5. Feature Extraction
+# 5. center series 계산
+# ==========================================================
+def compute_center_series(center_x, center_y, bs_med):
+    center_x = np.asarray(center_x, dtype=float)
+    center_y = np.asarray(center_y, dtype=float)
+
+    x_rel = (center_x - center_x[0]) / bs_med
+    y_rel = (center_y - center_y[0]) / bs_med
+
+    return x_rel, y_rel
+
+
+# ==========================================================
+# 6. relation feature 계산
+# ==========================================================
+def compute_relation_features(
+    left_hip_x, left_hip_y, right_hip_x, right_hip_y,
+    left_sh_x, left_sh_y, right_sh_x, right_sh_y,
+    hip_center_x_rel, hip_center_y_rel,
+    shoulder_center_x_rel, shoulder_center_y_rel,
+    bs_med
+):
+    feats = {}
+
+    # ------------------------------------------------------
+    # Symmetry
+    # ------------------------------------------------------
+    hip_y_diff = np.abs((left_hip_y - right_hip_y) / bs_med)
+    hip_x_diff = np.abs((left_hip_x - right_hip_x) / bs_med)
+    shoulder_y_diff = np.abs((left_sh_y - right_sh_y) / bs_med)
+    shoulder_x_diff = np.abs((left_sh_x - right_sh_x) / bs_med)
+
+    feats.update(compute_abs_stats(hip_y_diff, "hip_y_symmetry"))
+    feats.update(compute_abs_stats(hip_x_diff, "hip_x_symmetry"))
+    feats.update(compute_abs_stats(shoulder_y_diff, "shoulder_y_symmetry"))
+    feats.update(compute_abs_stats(shoulder_x_diff, "shoulder_x_symmetry"))
+
+    # ------------------------------------------------------
+    # 중심 이동 안정성만 유지
+    # ------------------------------------------------------
+    feats["hip_center_horizontal_sway_sd"] = float(np.std(hip_center_x_rel))
+    feats["hip_center_vertical_sway_sd"] = float(np.std(hip_center_y_rel))
+    feats["shoulder_center_horizontal_sway_sd"] = float(np.std(shoulder_center_x_rel))
+    feats["shoulder_center_vertical_sway_sd"] = float(np.std(shoulder_center_y_rel))
+
+    return feats
+
+
+# ==========================================================
+# 7. Feature Extraction
 # ==========================================================
 def extract_features(video_path):
     if not os.path.exists(POSE_MODEL_PATH):
@@ -178,7 +241,6 @@ def extract_features(video_path):
 
     frame_idx = 0
 
-    # 각 관절별 좌표/가시성 저장
     joint_points = {joint_name: [] for joint_name in TARGET_JOINTS.keys()}
     joint_visible_flags = {joint_name: [] for joint_name in TARGET_JOINTS.keys()}
     body_sizes = []
@@ -212,10 +274,8 @@ def extract_features(video_path):
             if result.pose_landmarks:
                 lm = result.pose_landmarks[0]
 
-                # body size
                 body_sizes.append(robust_body_size_from_landmarks(lm, VISIBILITY_MIN))
 
-                # 각 관절 좌표 추출
                 for joint_name, joint_idx in TARGET_JOINTS.items():
                     if lm[joint_idx].visibility >= VISIBILITY_MIN:
                         joint_points[joint_name].append((lm[joint_idx].x, lm[joint_idx].y))
@@ -223,7 +283,6 @@ def extract_features(video_path):
                     else:
                         joint_points[joint_name].append((np.nan, np.nan))
                         joint_visible_flags[joint_name].append(False)
-
             else:
                 body_sizes.append(np.nan)
                 for joint_name in TARGET_JOINTS.keys():
@@ -234,7 +293,6 @@ def extract_features(video_path):
 
     cap.release()
 
-    # body size median 계산
     bs = np.array(body_sizes, dtype=float)
     valid_bs = bs[np.isfinite(bs)]
 
@@ -247,14 +305,20 @@ def extract_features(video_path):
         print(f"❌ BodySize 비정상 → {os.path.basename(video_path)}")
         return None
 
+    video_id, label = extract_id_and_label(video_path)
+
     feats = {
-        "id": extract_id_and_label(video_path)[0],
-        "label": extract_id_and_label(video_path)[1],
+        "id": video_id,
+        "label": label,
         "total_time": total_time,
         "body_size_median": bs_med,
     }
 
-    # 각 관절별 인식률 확인 및 feature 계산
+    processed = {}
+
+    # ------------------------------------------------------
+    # recognition ratio는 저장하지 않고 품질 필터링만 수행
+    # ------------------------------------------------------
     for joint_name in TARGET_JOINTS.keys():
         visible_flags = joint_visible_flags[joint_name]
         recognition_ratio = float(np.mean(visible_flags)) if visible_flags else 0.0
@@ -269,23 +333,67 @@ def extract_features(video_path):
         joint_x = fill_missing(joint_x)
         joint_y = fill_missing(joint_y)
 
-        joint_xy = list(zip(joint_x, joint_y))
+        processed[joint_name] = {
+            "x": joint_x,
+            "y": joint_y
+        }
 
+    # ------------------------------------------------------
+    # 개별 관절 feature
+    # ------------------------------------------------------
+    for joint_name in TARGET_JOINTS.keys():
         joint_feats = compute_joint_features(
-            joint_xy=joint_xy,
+            joint_x=processed[joint_name]["x"],
+            joint_y=processed[joint_name]["y"],
             bs_med=bs_med,
             dt=dt,
             smooth_window=SMOOTH_WINDOW,
             joint_name=joint_name
         )
-
         feats.update(joint_feats)
+
+    # ------------------------------------------------------
+    # center 계산 (feature 추출은 하지 않고 sway 계산용으로만 사용)
+    # ------------------------------------------------------
+    left_hip_x = processed["left_hip"]["x"]
+    left_hip_y = processed["left_hip"]["y"]
+    right_hip_x = processed["right_hip"]["x"]
+    right_hip_y = processed["right_hip"]["y"]
+
+    left_sh_x = processed["left_shoulder"]["x"]
+    left_sh_y = processed["left_shoulder"]["y"]
+    right_sh_x = processed["right_shoulder"]["x"]
+    right_sh_y = processed["right_shoulder"]["y"]
+
+    hip_center_x = (left_hip_x + right_hip_x) / 2.0
+    hip_center_y = (left_hip_y + right_hip_y) / 2.0
+    shoulder_center_x = (left_sh_x + right_sh_x) / 2.0
+    shoulder_center_y = (left_sh_y + right_sh_y) / 2.0
+
+    hip_center_x_rel, hip_center_y_rel = compute_center_series(
+        hip_center_x, hip_center_y, bs_med
+    )
+    shoulder_center_x_rel, shoulder_center_y_rel = compute_center_series(
+        shoulder_center_x, shoulder_center_y, bs_med
+    )
+
+    # ------------------------------------------------------
+    # relation feature
+    # ------------------------------------------------------
+    relation_feats = compute_relation_features(
+        left_hip_x, left_hip_y, right_hip_x, right_hip_y,
+        left_sh_x, left_sh_y, right_sh_x, right_sh_y,
+        hip_center_x_rel, hip_center_y_rel,
+        shoulder_center_x_rel, shoulder_center_y_rel,
+        bs_med
+    )
+    feats.update(relation_feats)
 
     return feats
 
 
 # ==========================================================
-# 6. MAIN
+# 8. MAIN
 # ==========================================================
 def main():
     files = glob.glob(os.path.join(VIDEO_DIR, "*.mp4")) + \
