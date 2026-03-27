@@ -54,10 +54,11 @@ def analyze_joint_visibility(video_path):
     fps = 30.0 if fps <= 0 else fps
 
     total_processed_frames = 0
-    pose_detected_frames = 0
+    pose_detected_frames   = 0
 
-    visibility_sums = np.zeros(33, dtype=float)
-    recognized_counts = np.zeros(33, dtype=int)
+    visibility_sums    = np.zeros(33, dtype=float)
+    visibility_sq_sums = np.zeros(33, dtype=float)   # 표준편차 계산용 제곱합
+    recognized_counts  = np.zeros(33, dtype=int)
 
     base_options = tasks.BaseOptions(model_asset_path=POSE_MODEL_PATH)
     options = vision.PoseLandmarkerOptions(
@@ -84,7 +85,7 @@ def analyze_joint_visibility(video_path):
 
             total_processed_frames += 1
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_frame = mp_image.Image(
                 image_format=mp_image.ImageFormat.SRGB,
                 data=rgb
@@ -101,7 +102,8 @@ def analyze_joint_visibility(video_path):
                     vis = getattr(lm[i], "visibility", np.nan)
 
                     if np.isfinite(vis):
-                        visibility_sums[i] += vis
+                        visibility_sums[i]    += vis
+                        visibility_sq_sums[i] += vis ** 2
                         if vis >= VISIBILITY_MIN:
                             recognized_counts[i] += 1
 
@@ -114,19 +116,30 @@ def analyze_joint_visibility(video_path):
         return None
 
     rows = []
+    n = total_processed_frames
+
     for i, name in enumerate(LANDMARK_NAMES):
-        avg_visibility = visibility_sums[i] / total_processed_frames
-        recognition_rate = (recognized_counts[i] / total_processed_frames) * 100.0
+        mean_vis = visibility_sums[i] / n
+
+        # 표본 표준편차 (n-1 사용, n=1이면 0)
+        if n > 1:
+            variance = (visibility_sq_sums[i] - n * mean_vis ** 2) / (n - 1)
+            std_vis  = np.sqrt(max(variance, 0.0))
+        else:
+            std_vis  = 0.0
+
+        recognition_rate = (recognized_counts[i] / n) * 100.0
 
         rows.append({
-            "video_name": os.path.basename(video_path),
-            "landmark_id": i,
-            "landmark_name": name,
-            "total_processed_frames": total_processed_frames,
-            "pose_detected_frames": pose_detected_frames,
-            "recognized_frames": int(recognized_counts[i]),
-            "average_visibility": round(float(avg_visibility), 6),
-            "recognition_rate_percent": round(float(recognition_rate), 2)
+            "video_name":              os.path.basename(video_path),
+            "landmark_id":             i,
+            "landmark_name":           name,
+            "total_processed_frames":  total_processed_frames,
+            "pose_detected_frames":    pose_detected_frames,
+            "recognized_frames":       int(recognized_counts[i]),
+            "average_visibility":      round(float(mean_vis), 2),
+            "std_visibility":          round(float(std_vis), 2),
+            "recognition_rate_percent":round(float(recognition_rate), 2)
         })
 
     df = pd.DataFrame(rows)
@@ -137,10 +150,12 @@ def analyze_joint_visibility(video_path):
 # 2. 전체 영상 분석
 # ==========================================================
 def main():
-    files = glob.glob(os.path.join(VIDEO_DIR, "*.mp4")) + \
-            glob.glob(os.path.join(VIDEO_DIR, "*.mov")) + \
-            glob.glob(os.path.join(VIDEO_DIR, "*.avi")) + \
-            glob.glob(os.path.join(VIDEO_DIR, "*.mkv"))
+    files = (
+        glob.glob(os.path.join(VIDEO_DIR, "*.mp4")) +
+        glob.glob(os.path.join(VIDEO_DIR, "*.mov")) +
+        glob.glob(os.path.join(VIDEO_DIR, "*.avi")) +
+        glob.glob(os.path.join(VIDEO_DIR, "*.mkv"))
+    )
 
     if not files:
         print("❌ 분석할 비디오가 없습니다.")
@@ -148,9 +163,9 @@ def main():
 
     print(f"📁 총 {len(files)}개 비디오 분석 시작\n")
 
-    all_results = []
+    all_results   = []
     success_count = 0
-    fail_count = 0
+    fail_count    = 0
 
     for idx, video_path in enumerate(files, 1):
         base = os.path.splitext(os.path.basename(video_path))[0]
@@ -162,10 +177,6 @@ def main():
             print(f"  ❌ 분석 실패 → {video_path}\n")
             fail_count += 1
             continue
-
-        save_csv = os.path.join(OUTPUT_DIR, f"{base}_joint_visibility.csv")
-        df.to_csv(save_csv, index=False, encoding="utf-8-sig")
-        print(f"  ✅ 저장 완료: {base}_joint_visibility.csv\n")
 
         all_results.append(df)
         success_count += 1
@@ -181,16 +192,30 @@ def main():
 
         summary_df = (
             final_df.groupby(["landmark_id", "landmark_name"], as_index=False)
-            .agg({
-                "average_visibility": "mean",
-                "recognition_rate_percent": "mean"
-            })
-            .round(4)
-            .sort_values(by="recognition_rate_percent", ascending=False)
+            .agg(
+                average_visibility_mean    = ("average_visibility",       "mean"),
+                average_visibility_std     = ("average_visibility",       "std"),
+                recognition_rate_mean      = ("recognition_rate_percent", "mean"),
+                recognition_rate_std       = ("recognition_rate_percent", "std"),
+            )
+            .sort_values(by="recognition_rate_mean", ascending=False)
         )
 
-        summary_save = os.path.join(OUTPUT_DIR, "joint_visibility_summary.csv")
-        summary_df.to_csv(summary_save, index=False, encoding="utf-8-sig")
+        # 소수점 2자리 통일
+        for col in ["average_visibility_mean", "average_visibility_std",
+                    "recognition_rate_mean",   "recognition_rate_std"]:
+            summary_df[col] = summary_df[col].round(2)
+
+        summary_save = os.path.join(OUTPUT_DIR, "joint_visibility_summary.xlsx")
+        with pd.ExcelWriter(summary_save, engine="openpyxl") as writer:
+            summary_df.to_excel(writer, index=False, sheet_name="Summary")
+
+            # 열 너비 자동 조정
+            ws = writer.sheets["Summary"]
+            for col in ws.columns:
+                max_len = max(len(str(cell.value)) if cell.value is not None else 0
+                              for cell in col)
+                ws.column_dimensions[col[0].column_letter].width = max_len + 4
 
         print("=" * 60)
         print("🎉 관절 인식률 분석 완료!")
