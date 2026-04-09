@@ -33,13 +33,21 @@ CLASS_NAMES = ["Advanced", "Intermediate"]
 # 1. 데이터 불러오기
 # =====================================================
 def load_data():
-    files = glob.glob("./features_xlsx/*.xlsx")
+    files = glob.glob("./features_output/*.csv")
+    files = [f for f in files if os.path.basename(f) != "all_global_features.csv"]
     if not files:
-        raise FileNotFoundError("features_xlsx 폴더에 엑셀 파일이 없습니다.")
+        raise FileNotFoundError("features_output 폴더에 CSV 파일이 없습니다.")
 
     dfs = []
     for f in files:
-        tmp = pd.read_excel(f)
+        try:
+            tmp = pd.read_csv(f, encoding="utf-8-sig")
+        except Exception:
+            try:
+                tmp = pd.read_csv(f, encoding="utf-8")
+            except Exception:
+                tmp = pd.read_csv(f, encoding="cp949")
+
         basename = os.path.basename(f)
         person_id = basename.split("_")[0]
         tmp["person_id"] = person_id
@@ -55,7 +63,7 @@ def load_data():
 def rebuild_split(df, selected_features):
     from sklearn.model_selection import GroupShuffleSplit
 
-    exclude_features = ["id", "label", "total_time", "body_size_median", "person_id"]
+    exclude_features = ["id", "label", "body_size_median", "person_id"]
     feature_cols = df.select_dtypes(include=["float64", "int64"]).columns.tolist()
     feature_cols = [c for c in feature_cols if c not in exclude_features]
 
@@ -183,4 +191,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()ㅌ
+    main()
