@@ -1,9 +1,22 @@
-# -*- coding: utf-8 -*-
 """
-클라이밍 영상 MediaPipe 2D 기반 feature extraction 최종 코드
-- wrist / ankle / hip + COM
-- shoulder는 body size 정규화 및 symmetry 계산용
-- symmetry는 shoulder, hip만 사용
+클라이밍 영상 MediaPipe 2D 기반 feature extraction
+- 총 86개 변수 추출
+  * 운동학 (kinematics)
+      - 8개 관절 (left/right shoulder, hip, wrist, ankle) × 6개 = 48개
+        변수: velocity(mean/max/sd), acceleration(mean/max/sd)
+      - 2개 center (shoulder_center, hip_center) × 9개 = 18개
+        변수: velocity(mean/max/sd), acceleration(mean/max/sd), jerk(mean/max/sd)
+      → 소계: 66개
+  * center 추가변수 : 8개
+      hip_center_gie, shoulder_center_gie          (ConvexHull 기반 경로 효율성)
+      hip_center_path_efficiency,                  (직선거리 / 누적거리)
+      shoulder_center_path_efficiency,
+      hip_center_horizontal_sway,                  (x좌표 std)
+      hip_center_vertical_sway,                    (y좌표 std)
+      shoulder_center_horizontal_sway,
+      shoulder_center_vertical_sway
+  * symmetry : 12개
+      shoulder_x/y_symmetry(mean/max/sd), hip_x/y_symmetry(mean/max/sd)
 - 출력 파일명: 01_0.csv 형식
 """
 
@@ -11,7 +24,6 @@ import os
 import glob
 import traceback
 from typing import Dict, List, Tuple, Optional
-
 import cv2
 import numpy as np
 import pandas as pd
@@ -26,9 +38,7 @@ from scipy.spatial import ConvexHull
 
 INPUT_VIDEO_DIR = "./videos"
 OUTPUT_ROOT_DIR = "./features_output"
-
 POSE_MODEL_PATH = "./models/pose_landmarker_full.task"
-
 VIDEO_EXTENSIONS = ("*.mp4", "*.mov", "*.avi", "*.mkv", "*.MP4", "*.MOV", "*.AVI", "*.MKV")
 
 VISIBILITY_MIN = 0.5
@@ -84,27 +94,28 @@ POSE_IDX = {
     "right_foot_index": 32,
 }
 
-LANDMARK_MAP_FEATURE = {
-    "left_wrist": POSE_IDX["left_wrist"],
-    "right_wrist": POSE_IDX["right_wrist"],
-    "left_ankle": POSE_IDX["left_ankle"],
-    "right_ankle": POSE_IDX["right_ankle"],
-    "left_hip": POSE_IDX["left_hip"],
-    "right_hip": POSE_IDX["right_hip"],
-}
-
-LANDMARK_MAP_NORMALIZE = {
-    "left_shoulder": POSE_IDX["left_shoulder"],
+# 실제 landmark에서 추출할 8개 관절
+LANDMARK_MAP_RAW = {
+    "left_shoulder":  POSE_IDX["left_shoulder"],
     "right_shoulder": POSE_IDX["right_shoulder"],
+    "left_hip":       POSE_IDX["left_hip"],
+    "right_hip":      POSE_IDX["right_hip"],
+    "left_wrist":     POSE_IDX["left_wrist"],
+    "right_wrist":    POSE_IDX["right_wrist"],
+    "left_ankle":     POSE_IDX["left_ankle"],
+    "right_ankle":    POSE_IDX["right_ankle"],
 }
 
-LANDMARK_MAP_ALL = {}
-LANDMARK_MAP_ALL.update(LANDMARK_MAP_FEATURE)
-LANDMARK_MAP_ALL.update(LANDMARK_MAP_NORMALIZE)
+# velocity + acceleration만 계산할 8개 관절 (jerk 없음)
+JOINTS_RAW = [
+    "left_shoulder", "right_shoulder",
+    "left_hip",      "right_hip",
+    "left_wrist",    "right_wrist",
+    "left_ankle",    "right_ankle",
+]
 
-JOINTS_6 = ["left_wrist", "right_wrist", "left_ankle", "right_ankle", "left_hip", "right_hip"]
-JOINTS_NORMALIZE = ["left_shoulder", "right_shoulder"]
-JOINTS_ALL = JOINTS_6 + JOINTS_NORMALIZE
+# velocity + acceleration + jerk 모두 계산할 2개 center
+JOINTS_CENTER = ["shoulder_center", "hip_center"]
 
 # =========================================================
 # 2. 폴더 생성
@@ -138,7 +149,7 @@ def get_video_metadata(video_path: str) -> Tuple[float, int, int, int]:
         fps = 30.0
 
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cap.release()
     return fps, frame_count, width, height
@@ -155,41 +166,29 @@ def parse_label_from_filename(video_name: str) -> Optional[int]:
 
 
 def make_output_id(video_name: str) -> str:
-    """
-    예:
-    01_박민희_0_250110_v3 -> 01_0
-    """
+    """예: 01_박민희_0_250110_v3 → 01_0"""
     parts = video_name.split("_")
     if len(parts) >= 3:
-        person_no = parts[0]
-        label = parts[2]
-        return f"{person_no}_{label}"
+        return f"{parts[0]}_{parts[2]}"
     return video_name
 
 
 def get_output_csv_path(video_path: str) -> str:
-    """
-    저장 파일명도 01_0.csv 형식으로 저장
-    예:
-    01_박민희_0_250110_v3.mp4 -> 01_0.csv
-    """
     video_name = safe_video_basename(video_path)
-    output_id = make_output_id(video_name)
+    output_id  = make_output_id(video_name)
     return os.path.join(OUTPUT_ROOT_DIR, f"{output_id}.csv")
 
 # =========================================================
-# 4. NaN 처리 관련 함수
+# 4. NaN 처리
 # =========================================================
 
 def interpolate_short_gaps(series: pd.Series, max_gap: int = 5) -> pd.Series:
     s = series.copy()
-
     if s.isna().sum() == 0:
         return s
 
     is_nan = s.isna().to_numpy()
     n = len(s)
-
     start = None
     gap_segments = []
 
@@ -197,19 +196,16 @@ def interpolate_short_gaps(series: pd.Series, max_gap: int = 5) -> pd.Series:
         if is_nan[i] and start is None:
             start = i
         elif not is_nan[i] and start is not None:
-            end = i - 1
-            gap_segments.append((start, end))
+            gap_segments.append((start, i - 1))
             start = None
-
     if start is not None:
         gap_segments.append((start, n - 1))
 
     for gap_start, gap_end in gap_segments:
-        gap_len = gap_end - gap_start + 1
-        left_idx = gap_start - 1
+        gap_len   = gap_end - gap_start + 1
+        left_idx  = gap_start - 1
         right_idx = gap_end + 1
-
-        has_left = left_idx >= 0 and pd.notna(s.iloc[left_idx])
+        has_left  = left_idx >= 0 and pd.notna(s.iloc[left_idx])
         has_right = right_idx < n and pd.notna(s.iloc[right_idx])
 
         if gap_len <= max_gap and has_left and has_right:
@@ -223,11 +219,12 @@ def interpolate_short_gaps(series: pd.Series, max_gap: int = 5) -> pd.Series:
 def apply_short_gap_interpolation(df: pd.DataFrame, columns: List[str], max_gap: int) -> pd.DataFrame:
     out = df.copy()
     for col in columns:
-        out[col] = interpolate_short_gaps(out[col], max_gap=max_gap)
+        if col in out.columns:
+            out[col] = interpolate_short_gaps(out[col], max_gap=max_gap)
     return out
 
 # =========================================================
-# 5. 시계열 변수 계산 함수
+# 5. 운동학 계산 함수
 # =========================================================
 
 def compute_velocity(x: pd.Series, y: pd.Series, dt: float) -> pd.Series:
@@ -240,52 +237,87 @@ def compute_acceleration(v: pd.Series, dt: float) -> pd.Series:
     return v.diff() / dt
 
 
-def compute_gie(x: pd.Series, y: pd.Series) -> float:
-    coords = np.column_stack([x.to_numpy(), y.to_numpy()])
-    valid_mask = ~np.isnan(coords).any(axis=1)
-    coords = coords[valid_mask]
+def compute_jerk(a: pd.Series, dt: float) -> pd.Series:
+    return a.diff() / dt
 
-    if len(coords) < 3:
+# =========================================================
+# 6. GIE (Global Index of Efficiency) — 구버전 com_gie와 동일 수식
+# =========================================================
+
+def compute_gie(x: pd.Series, y: pd.Series) -> float:
+    """
+    GIE = (log(2L) - log(c)) / log(2)
+    L = 누적 이동 거리
+    c = ConvexHull 넓이 (경로가 차지하는 공간)
+    값이 클수록 좁은 공간에서 많이 이동 → 효율적인 경로
+    """
+    coords = np.column_stack([x.to_numpy(), y.to_numpy()])
+    valid  = coords[~np.isnan(coords).any(axis=1)]
+
+    if len(valid) < 3:
         return np.nan
 
-    diffs = np.diff(coords, axis=0)
+    diffs        = np.diff(valid, axis=0)
     step_lengths = np.sqrt(np.sum(diffs ** 2, axis=1))
-    L = np.sum(step_lengths)
+    L            = np.sum(step_lengths)
 
     if L <= 0:
         return np.nan
 
     try:
-        hull = ConvexHull(coords)
-        c = hull.area
+        hull = ConvexHull(valid)
+        c    = hull.area
     except Exception:
         return np.nan
 
     if c <= 0:
         return np.nan
 
-    gie = (np.log(2 * L) - np.log(c)) / np.log(2)
-    return float(gie)
+    return float((np.log(2 * L) - np.log(c)) / np.log(2))
 
 # =========================================================
-# 6. 요약 통계 계산 함수
+# 7. Path Efficiency — 직선거리 / 누적거리
+# =========================================================
+
+def compute_path_efficiency(x: pd.Series, y: pd.Series) -> float:
+    """
+    path_efficiency = 직선 거리(시작→끝) / 누적 이동 거리
+    1에 가까울수록 직선에 가깝게 이동
+    """
+    coords = np.column_stack([x.to_numpy(), y.to_numpy()])
+    valid  = coords[~np.isnan(coords).any(axis=1)]
+
+    if len(valid) < 2:
+        return np.nan
+
+    diffs        = np.diff(valid, axis=0)
+    step_lengths = np.sqrt(np.sum(diffs ** 2, axis=1))
+    total_path   = np.sum(step_lengths)
+
+    if total_path <= 0:
+        return np.nan
+
+    straight_line = np.sqrt(np.sum((valid[-1] - valid[0]) ** 2))
+    return float(straight_line / total_path)
+
+# =========================================================
+# 8. 요약 통계
 # =========================================================
 
 def summarize_series(series: pd.Series, prefix: str) -> Dict[str, float]:
     return {
-        f"{prefix}_mean": series.mean(skipna=True),
-        f"{prefix}_max": series.max(skipna=True),
-        f"{prefix}_sd": series.std(skipna=True),
+        f"{prefix}_mean": float(series.mean(skipna=True)),
+        f"{prefix}_max":  float(series.max(skipna=True)),
+        f"{prefix}_sd":   float(series.std(skipna=True)),
     }
 
 # =========================================================
-# 7. Raw landmark 추출
+# 9. Raw landmark 추출
 # =========================================================
 
 def extract_raw_landmarks_from_video(video_path: str) -> pd.DataFrame:
     fps, frame_count, width, height = get_video_metadata(video_path)
     cap = cv2.VideoCapture(video_path)
-
     if not cap.isOpened():
         raise ValueError(f"영상 열기 실패: {video_path}")
 
@@ -303,7 +335,7 @@ def extract_raw_landmarks_from_video(video_path: str) -> pd.DataFrame:
     )
 
     with vision.PoseLandmarker.create_from_options(options) as landmarker:
-        frame_idx = 0
+        frame_idx     = 0
         processed_idx = 0
 
         while True:
@@ -315,33 +347,31 @@ def extract_raw_landmarks_from_video(video_path: str) -> pd.DataFrame:
                 frame_idx += 1
                 continue
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-
+            rgb               = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image          = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             frame_timestamp_ms = int((frame_idx / fps) * 1000)
-            result = landmarker.detect_for_video(mp_image, frame_timestamp_ms)
+            result            = landmarker.detect_for_video(mp_image, frame_timestamp_ms)
 
             row = {
-                "video_name": safe_video_basename(video_path),
-                "frame_idx": frame_idx,
+                "video_name":    safe_video_basename(video_path),
+                "frame_idx":     frame_idx,
                 "processed_idx": processed_idx,
                 "timestamp_sec": frame_idx / fps if fps > 0 else np.nan,
-                "fps": fps,
-                "frame_width": width,
-                "frame_height": height,
+                "fps":           fps,
+                "frame_width":   width,
+                "frame_height":  height,
             }
 
             if result.pose_landmarks is None or len(result.pose_landmarks) == 0:
-                for joint_name in JOINTS_ALL:
+                for joint_name in LANDMARK_MAP_RAW:
                     row[f"{joint_name}_x"] = np.nan
                     row[f"{joint_name}_y"] = np.nan
                     if SAVE_VISIBILITY:
                         row[f"{joint_name}_visibility"] = np.nan
             else:
                 landmarks = result.pose_landmarks[0]
-
-                for joint_name, idx in LANDMARK_MAP_ALL.items():
-                    lm = landmarks[idx]
+                for joint_name, idx in LANDMARK_MAP_RAW.items():
+                    lm         = landmarks[idx]
                     visibility = float(getattr(lm, "visibility", np.nan))
 
                     if np.isnan(visibility) or visibility < VISIBILITY_MIN:
@@ -361,28 +391,25 @@ def extract_raw_landmarks_from_video(video_path: str) -> pd.DataFrame:
 
             rows.append(row)
             processed_idx += 1
-            frame_idx += 1
+            frame_idx     += 1
 
     cap.release()
     return pd.DataFrame(rows)
 
 # =========================================================
-# 8. 신체 정규화 관련 함수
+# 10. 신체 정규화
 # =========================================================
 
 def add_body_size_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-
     out["shoulder_width"] = np.sqrt(
         (out["right_shoulder_x"] - out["left_shoulder_x"]) ** 2 +
         (out["right_shoulder_y"] - out["left_shoulder_y"]) ** 2
     )
-
     out["hip_width"] = np.sqrt(
         (out["right_hip_x"] - out["left_hip_x"]) ** 2 +
         (out["right_hip_y"] - out["left_hip_y"]) ** 2
     )
-
     out["body_size"] = (out["shoulder_width"] + out["hip_width"]) / 2.0
     return out
 
@@ -390,49 +417,67 @@ def add_body_size_columns(df: pd.DataFrame) -> pd.DataFrame:
 def compute_body_size_median(df: pd.DataFrame) -> float:
     if "body_size" not in df.columns:
         return np.nan
-
     valid = df["body_size"].dropna()
     valid = valid[valid > 0]
-
     if len(valid) == 0:
         return np.nan
-
     return float(valid.median())
 
 
 def normalize_coordinates_inplace(df: pd.DataFrame, body_size_median: float) -> pd.DataFrame:
     out = df.copy()
-
     if pd.isna(body_size_median) or body_size_median <= 0:
-        for joint in JOINTS_ALL:
+        for joint in LANDMARK_MAP_RAW:
             out[f"{joint}_x"] = np.nan
             out[f"{joint}_y"] = np.nan
         return out
 
-    for joint in JOINTS_ALL:
+    for joint in LANDMARK_MAP_RAW:
         out[f"{joint}_x"] = out[f"{joint}_x"] / body_size_median
         out[f"{joint}_y"] = out[f"{joint}_y"] / body_size_median
-
     return out
 
+# =========================================================
+# 11. center (shoulder_center, hip_center) 좌표 추가
+#     한쪽이라도 NaN이면 center도 NaN
+# =========================================================
 
-def add_com_columns(df: pd.DataFrame) -> pd.DataFrame:
+def add_center_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    out["com_x"] = (out["left_hip_x"] + out["right_hip_x"]) / 2.0
-    out["com_y"] = (out["left_hip_y"] + out["right_hip_y"]) / 2.0
+
+    for left, right, center in [
+        ("left_shoulder", "right_shoulder", "shoulder_center"),
+        ("left_hip",      "right_hip",      "hip_center"),
+    ]:
+        both_valid = out[f"{left}_x"].notna() & out[f"{right}_x"].notna()
+
+        out[f"{center}_x"] = np.where(
+            both_valid,
+            (out[f"{left}_x"] + out[f"{right}_x"]) / 2.0,
+            np.nan
+        )
+        out[f"{center}_y"] = np.where(
+            both_valid,
+            (out[f"{left}_y"] + out[f"{right}_y"]) / 2.0,
+            np.nan
+        )
+
     return out
 
+# =========================================================
+# 12. 보간 대상 컬럼 목록
+# =========================================================
 
 def get_xy_columns_for_interpolation() -> List[str]:
     cols = []
-    for joint in JOINTS_ALL:
-        cols.append(f"{joint}_x")
-        cols.append(f"{joint}_y")
-    cols += ["com_x", "com_y"]
+    for joint in JOINTS_RAW:
+        cols += [f"{joint}_x", f"{joint}_y"]
+    for c in JOINTS_CENTER:
+        cols += [f"{c}_x", f"{c}_y"]
     return cols
 
 # =========================================================
-# 9. time-series 변수 생성
+# 13. time-series 변수 생성
 # =========================================================
 
 def build_timeseries_variables(df_raw: pd.DataFrame) -> Tuple[pd.DataFrame, float]:
@@ -441,91 +486,115 @@ def build_timeseries_variables(df_raw: pd.DataFrame) -> Tuple[pd.DataFrame, floa
 
     out = df_raw.copy()
 
+    # 신체 크기 정규화
     out = add_body_size_columns(out)
     body_size_median = compute_body_size_median(out)
-
     out = normalize_coordinates_inplace(out, body_size_median)
-    out = add_com_columns(out)
 
+    # center 좌표 추가 (한쪽 NaN → center NaN)
+    out = add_center_columns(out)
+
+    # 보간
     interp_cols = get_xy_columns_for_interpolation()
     out = apply_short_gap_interpolation(out, interp_cols, max_gap=MAX_INTERP_GAP)
 
     fps_values = out["fps"].dropna().unique()
     fps = fps_values[0] if len(fps_values) > 0 and fps_values[0] > 0 else 30.0
-    dt = 1.0 / fps
+    dt  = 1.0 / fps
 
-    out["com_velocity"] = compute_velocity(out["com_x"], out["com_y"], dt)
-    out["com_acceleration"] = compute_acceleration(out["com_velocity"], dt)
-
-    for joint in JOINTS_6:
-        x_col = f"{joint}_x"
-        y_col = f"{joint}_y"
+    # ── 8개 관절: velocity + acceleration만 (jerk 없음) ──
+    for joint in JOINTS_RAW:
         v_col = f"{joint}_velocity"
         a_col = f"{joint}_acceleration"
-
-        out[v_col] = compute_velocity(out[x_col], out[y_col], dt)
+        out[v_col] = compute_velocity(out[f"{joint}_x"], out[f"{joint}_y"], dt)
         out[a_col] = compute_acceleration(out[v_col], dt)
 
-    # symmetry: shoulder, hip만 추가
+    # ── 2개 center: velocity + acceleration + jerk ──
+    for joint in JOINTS_CENTER:
+        v_col = f"{joint}_velocity"
+        a_col = f"{joint}_acceleration"
+        j_col = f"{joint}_jerk"
+        out[v_col] = compute_velocity(out[f"{joint}_x"], out[f"{joint}_y"], dt)
+        out[a_col] = compute_acceleration(out[v_col], dt)
+        out[j_col] = compute_jerk(out[a_col], dt)
+
+    # ── symmetry (shoulder, hip) ──
     out["shoulder_x_symmetry"] = (out["left_shoulder_x"] - out["right_shoulder_x"]).abs()
     out["shoulder_y_symmetry"] = (out["left_shoulder_y"] - out["right_shoulder_y"]).abs()
-
-    out["hip_x_symmetry"] = (out["left_hip_x"] - out["right_hip_x"]).abs()
-    out["hip_y_symmetry"] = (out["left_hip_y"] - out["right_hip_y"]).abs()
+    out["hip_x_symmetry"]      = (out["left_hip_x"]      - out["right_hip_x"]).abs()
+    out["hip_y_symmetry"]      = (out["left_hip_y"]      - out["right_hip_y"]).abs()
 
     return out, body_size_median
 
 # =========================================================
-# 10. summary feature 생성
+# 14. summary feature 생성 (86개)
 # =========================================================
 
 def build_summary_features(df_ts: pd.DataFrame, body_size_median: float) -> pd.DataFrame:
     if len(df_ts) == 0:
         return pd.DataFrame()
 
-    summary = {}
+    summary: Dict[str, float] = {}
 
     video_name = df_ts["video_name"].iloc[0]
-
-    summary["id"] = make_output_id(video_name)
-
-    if AUTO_PARSE_LABEL_FROM_FILENAME:
-        summary["label"] = parse_label_from_filename(video_name)
-    else:
-        summary["label"] = np.nan
-
+    summary["id"]              = make_output_id(video_name)
+    summary["label"]           = parse_label_from_filename(video_name) if AUTO_PARSE_LABEL_FROM_FILENAME else np.nan
     summary["body_size_median"] = body_size_median
 
-    # COM
-    summary["com_gie"] = compute_gie(df_ts["com_x"], df_ts["com_y"])
-    summary.update(summarize_series(df_ts["com_velocity"], "com_velocity"))
-    summary.update(summarize_series(df_ts["com_acceleration"], "com_acceleration"))
-
-    # 6개 관절
-    for joint in JOINTS_6:
-        summary.update(summarize_series(df_ts[f"{joint}_velocity"], f"{joint}_velocity"))
+    # ────────────────────────────────────────────────
+    # A. 운동학 — 8개 관절: velocity + acceleration (각 mean/max/sd) = 48개
+    # ────────────────────────────────────────────────
+    for joint in JOINTS_RAW:
+        summary.update(summarize_series(df_ts[f"{joint}_velocity"],     f"{joint}_velocity"))
         summary.update(summarize_series(df_ts[f"{joint}_acceleration"], f"{joint}_acceleration"))
 
-    # symmetry: shoulder, hip만 저장
-    symmetry_vars = [
-        "shoulder_x_symmetry", "shoulder_y_symmetry",
-        "hip_x_symmetry", "hip_y_symmetry",
-    ]
+    # ────────────────────────────────────────────────
+    # B. 운동학 — 2개 center: velocity + acceleration + jerk (각 mean/max/sd) = 18개
+    # ────────────────────────────────────────────────
+    for joint in JOINTS_CENTER:
+        summary.update(summarize_series(df_ts[f"{joint}_velocity"],     f"{joint}_velocity"))
+        summary.update(summarize_series(df_ts[f"{joint}_acceleration"], f"{joint}_acceleration"))
+        summary.update(summarize_series(df_ts[f"{joint}_jerk"],         f"{joint}_jerk"))
 
-    for var in symmetry_vars:
+    # ────────────────────────────────────────────────
+    # C. center 추가변수 8개
+    # ────────────────────────────────────────────────
+    # GIE (ConvexHull 기반 — 구버전 com_gie와 동일 수식)
+    summary["hip_center_gie"]      = compute_gie(df_ts["hip_center_x"],      df_ts["hip_center_y"])
+    summary["shoulder_center_gie"] = compute_gie(df_ts["shoulder_center_x"], df_ts["shoulder_center_y"])
+
+    # Path Efficiency (직선거리 / 누적거리)
+    summary["hip_center_path_efficiency"]      = compute_path_efficiency(df_ts["hip_center_x"],      df_ts["hip_center_y"])
+    summary["shoulder_center_path_efficiency"] = compute_path_efficiency(df_ts["shoulder_center_x"], df_ts["shoulder_center_y"])
+
+    # Sway (좌표 std)
+    summary["hip_center_horizontal_sway"]      = float(df_ts["hip_center_x"].std(skipna=True))
+    summary["hip_center_vertical_sway"]        = float(df_ts["hip_center_y"].std(skipna=True))
+    summary["shoulder_center_horizontal_sway"] = float(df_ts["shoulder_center_x"].std(skipna=True))
+    summary["shoulder_center_vertical_sway"]   = float(df_ts["shoulder_center_y"].std(skipna=True))
+
+    # ────────────────────────────────────────────────
+    # D. symmetry 12개
+    # ────────────────────────────────────────────────
+    for var in ["shoulder_x_symmetry", "shoulder_y_symmetry",
+                "hip_x_symmetry",      "hip_y_symmetry"]:
         summary.update(summarize_series(df_ts[var], var))
+
+    # 변수 수 검증
+    feature_cols = [c for c in summary if c not in ("id", "label", "body_size_median")]
+    assert len(feature_cols) == 86, f"변수 수 오류: {len(feature_cols)}개 (기대값: 86)"
 
     return pd.DataFrame([summary])
 
 # =========================================================
-# 11. 저장 함수
+# 15. 저장 함수
 # =========================================================
 
 def save_dataframe(df: pd.DataFrame, path: str) -> None:
     df.to_csv(path, index=False, encoding="utf-8-sig")
 
 # =========================================================
-# 12. 영상 1개 처리 + 영상별 CSV 저장
+# 16. 영상 1개 처리
 # =========================================================
 
 def process_single_video(video_path: str) -> Optional[pd.DataFrame]:
@@ -549,9 +618,11 @@ def process_single_video(video_path: str) -> Optional[pd.DataFrame]:
             print(f"[경고] summary feature 생성 결과가 비어 있습니다: {video_name}")
             return None
 
+        feature_cols = [c for c in df_summary.columns if c not in ("id", "label", "body_size_median")]
+        print(f"[변수 수] {len(feature_cols)}개 (기대값: 86)")
+
         save_path = get_output_csv_path(video_path)
         save_dataframe(df_summary, save_path)
-
         print(f"[저장 완료] {save_path}")
         print(f"[처리 완료] {video_name}")
         return df_summary
@@ -563,7 +634,7 @@ def process_single_video(video_path: str) -> Optional[pd.DataFrame]:
         return None
 
 # =========================================================
-# 13. 전체 영상 처리
+# 17. 전체 영상 처리
 # =========================================================
 
 def process_all_videos() -> None:
@@ -572,7 +643,7 @@ def process_all_videos() -> None:
     if not os.path.exists(POSE_MODEL_PATH):
         raise FileNotFoundError(
             f"Pose Landmarker 모델 파일을 찾을 수 없습니다: {POSE_MODEL_PATH}\n"
-            f"예: ./models/pose_landmarker_full.task"
+            "예: ./models/pose_landmarker_full.task"
         )
 
     video_files = get_video_file_list(INPUT_VIDEO_DIR)
@@ -583,7 +654,7 @@ def process_all_videos() -> None:
     print(f"[안내] 총 {len(video_files)}개 영상 발견")
 
     success_count = 0
-    fail_count = 0
+    fail_count    = 0
 
     for i, video_path in enumerate(video_files, start=1):
         print(f"\n[{i}/{len(video_files)}] 처리 중...")
@@ -600,7 +671,7 @@ def process_all_videos() -> None:
     print("=" * 80)
 
 # =========================================================
-# 14. 메인 실행
+# 18. 메인 실행
 # =========================================================
 
 if __name__ == "__main__":

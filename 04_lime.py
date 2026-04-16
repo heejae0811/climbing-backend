@@ -25,7 +25,6 @@ os.makedirs(LIME_DIR, exist_ok=True)
 # "n"          : 랜덤 n개 (아래 SAMPLE_N 설정)
 SAMPLE_MODE = "all"
 SAMPLE_N = 10  # SAMPLE_MODE = "n" 일 때만 사용
-
 CLASS_NAMES = ["Advanced", "Intermediate"]
 
 
@@ -63,7 +62,7 @@ def load_data():
 def rebuild_split(df, selected_features):
     from sklearn.model_selection import GroupShuffleSplit
 
-    exclude_features = ["id", "label", "body_size_median", "person_id"]
+    exclude_features = ["id", "label", "body_size_median"]
     feature_cols = df.select_dtypes(include=["float64", "int64"]).columns.tolist()
     feature_cols = [c for c in feature_cols if c not in exclude_features]
 
@@ -121,9 +120,21 @@ def select_samples(model, X_test, y_test):
 # 4. LIME HTML 생성
 # =====================================================
 def generate_lime_htmls(model, X_train, X_test, y_test, y_pred, indices, selected_features, video_ids):
+    FEATURE_NAME_MAP = {
+        "hip_center_velocity_mean": "Hip speed",
+        "shoulder_y_symmetry_mean": "Shoulder height symmetry",
+        "hip_center_jerk_sd": "Hip movement smoothness",
+        "hip_center_velocity_sd": "Hip speed consistency",
+        "left_hip_velocity_mean": "Left hip speed",
+        "shoulder_center_vertical_sway": "Shoulder vertical sway",
+        "hip_center_acceleration_sd": "Hip acceleration consistency",
+        "right_hip_acceleration_mean": "Right hip acceleration",
+    }
+    pretty = [FEATURE_NAME_MAP.get(f, f) for f in selected_features]
+
     explainer = LimeTabularExplainer(
         training_data=np.array(X_train),
-        feature_names=selected_features,
+        feature_names=pretty,
         class_names=CLASS_NAMES,
         mode="classification",
         random_state=RANDOM_STATE
