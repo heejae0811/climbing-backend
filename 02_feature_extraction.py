@@ -20,8 +20,11 @@
   → Maloney (2019); Bishop et al. (2018)
   (center 관절은 좌우 중간값이므로 symmetry 계산 불가, 제외)
 
-- 정규화: shoulder_width + hip_width 평균의 영상 전체 median
-  → Liu et al. (2021 ICCV); Sun et al. (2019 CVPR)
+- 정규화: 어깨 중심(shoulder center)과 골반 중심(hip center) 사이의
+  Euclidean 거리(torso height)의 영상 전체 median
+  → Yeung et al. (2025 CVPR Workshop); Tompson et al. (2015 CVPR)
+  ※ 이전 버전(v1)에서는 shoulder_width + hip_width 평균을 사용했으나,
+     선행 연구 기준에 맞게 torso height 방식으로 변경
 
 [총 feature 수: 144개]
   velocity:          10관절 × 3 =  30
@@ -46,8 +49,8 @@
   Lamoth CJC et al. Gait Posture. 2009;29(4):546-551.
   Maloney SJ. J Strength Cond Res. 2019;33(9):2579-2593.
   Bishop C et al. Strength Cond J. 2018;40(4):1-6.
-  Liu J et al. ICCV. 2021:11796-11806.
-  Sun K et al. CVPR. 2019:5693-5703.
+  Yeung C et al. CVPR Workshop. 2025:5944-5955.
+  Tompson JJ et al. CVPR. 2015:648-656.
 """
 
 import os
@@ -401,23 +404,58 @@ def extract_raw_landmarks_from_video(video_path: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 # =========================================================
-# 9. 신체 크기 정규화
-#    영상 내 카메라 거리·각도 차이로 인한 관절 좌표 스케일 차이 보정
-#    shoulder_width + hip_width 평균의 영상 전체 median을 정규화 인자로 사용
-#    Liu et al. (2021 ICCV); Sun et al. (2019 CVPR)
+# 9. 신체 크기 정규화 (v2: torso height 방식)
+#
+#    [변경 사항]
+#    v1: (shoulder_width + hip_width) / 2 의 median
+#        → 어깨 너비와 골반 너비의 평균 (수평 거리 기반)
+#
+#    v2: shoulder_center ↔ hip_center 사이의 Euclidean 거리 (torso height)의 median
+#        → 어깨 중심과 골반 중심 사이의 수직+수평 거리 (torso 높이 기반)
+#        → Yeung et al. (2025 CVPR Workshop); Tompson et al. (2015 CVPR)
+#
+#    근거:
+#    Yeung et al. (2025)는 PDJ 평가에서 normalization factor를
+#    "the distance between the center of the shoulders and the center of the hips"
+#    로 명시하며, Tompson et al. (2015)을 인용.
+#    카메라 거리 차이로 인한 관절 좌표 스케일 차이를 보정하기 위해
+#    동일한 기준(torso height)을 적용하여 개인 간 신체 크기 차이를 제거.
 # =========================================================
 
 def add_body_size_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    어깨 중심(shoulder center)과 골반 중심(hip center) 사이의
+    Euclidean 거리를 torso height(body_size)로 계산.
+
+    두 관절 중 하나라도 NaN이면 해당 프레임의 body_size는 NaN 처리.
+
+    Yeung et al. (2025 CVPR Workshop); Tompson et al. (2015 CVPR)
+    """
     out = df.copy()
-    out["shoulder_width"] = np.sqrt(
-        (out["right_shoulder_x"] - out["left_shoulder_x"]) ** 2 +
-        (out["right_shoulder_y"] - out["left_shoulder_y"]) ** 2
+
+    # 어깨 중심 좌표
+    shoulder_center_x = (out["left_shoulder_x"] + out["right_shoulder_x"]) / 2.0
+    shoulder_center_y = (out["left_shoulder_y"] + out["right_shoulder_y"]) / 2.0
+
+    # 골반 중심 좌표
+    hip_center_x = (out["left_hip_x"] + out["right_hip_x"]) / 2.0
+    hip_center_y = (out["left_hip_y"] + out["right_hip_y"]) / 2.0
+
+    # torso height: 어깨 중심 ↔ 골반 중심 Euclidean 거리
+    out["body_size"] = np.sqrt(
+        (shoulder_center_x - hip_center_x) ** 2 +
+        (shoulder_center_y - hip_center_y) ** 2
     )
-    out["hip_width"] = np.sqrt(
-        (out["right_hip_x"] - out["left_hip_x"]) ** 2 +
-        (out["right_hip_y"] - out["left_hip_y"]) ** 2
+
+    # 4개 관절 중 하나라도 NaN이면 body_size도 NaN
+    any_nan = (
+        out["left_shoulder_x"].isna()  |
+        out["right_shoulder_x"].isna() |
+        out["left_hip_x"].isna()       |
+        out["right_hip_x"].isna()
     )
-    out["body_size"] = (out["shoulder_width"] + out["hip_width"]) / 2.0
+    out.loc[any_nan, "body_size"] = np.nan
+
     return out
 
 
@@ -489,7 +527,7 @@ def build_timeseries_variables(df_raw: pd.DataFrame) -> Tuple[pd.DataFrame, floa
 
     out = df_raw.copy()
 
-    # 신체 크기 정규화
+    # 신체 크기 정규화 (v2: torso height 방식)
     out              = add_body_size_columns(out)
     body_size_median = compute_body_size_median(out)
     out              = normalize_coordinates_inplace(out, body_size_median)
@@ -507,9 +545,6 @@ def build_timeseries_variables(df_raw: pd.DataFrame) -> Tuple[pd.DataFrame, floa
     dt  = 1.0 / fps
 
     # ── 모든 10개 관절: velocity + acceleration + jerk ──
-    # velocity  : Beltrán et al. (2023); Richter et al. (2022)
-    # acceleration: Boulanger et al. (2016); Richter et al. (2022)
-    # jerk      : Seifert et al. (2014); Kiely et al. (2019)
     for joint in JOINTS_ALL:
         v_col = f"{joint}_velocity"
         a_col = f"{joint}_acceleration"
@@ -519,7 +554,6 @@ def build_timeseries_variables(df_raw: pd.DataFrame) -> Tuple[pd.DataFrame, floa
         out[j_col] = compute_jerk(out[a_col], dt)
 
     # ── symmetry: shoulder / hip / wrist / ankle 4쌍 ──
-    # Maloney (2019); Bishop et al. (2018)
     for left, right, name in SYMMETRY_PAIRS:
         out[f"{name}_x_symmetry"] = (out[f"{left}_x"] - out[f"{right}_x"]).abs()
         out[f"{name}_y_symmetry"] = (out[f"{left}_y"] - out[f"{right}_y"]).abs()
@@ -545,7 +579,6 @@ def build_summary_features(df_ts: pd.DataFrame,
 
     # ────────────────────────────────────────────────────
     # A. velocity: 10관절 × mean/max/sd = 30개
-    #    Beltrán et al. (2023 Sensors); Richter et al. (2022 Sensors)
     # ────────────────────────────────────────────────────
     for joint in JOINTS_ALL:
         summary.update(
@@ -554,7 +587,6 @@ def build_summary_features(df_ts: pd.DataFrame,
 
     # ────────────────────────────────────────────────────
     # B. acceleration: 10관절 × mean/max/sd = 30개
-    #    Boulanger et al. (2016 IEEE Sens J); Richter et al. (2022 Sensors)
     # ────────────────────────────────────────────────────
     for joint in JOINTS_ALL:
         summary.update(
@@ -564,9 +596,6 @@ def build_summary_features(df_ts: pd.DataFrame,
 
     # ────────────────────────────────────────────────────
     # C. jerk: 10관절 × mean/max/sd = 30개
-    #    Seifert et al. (2014 J Appl Biomech)
-    #    Kiely et al. (2019 Sports Med Open)
-    #    Roren et al. (2022 Front Bioeng Biotechnol)
     # ────────────────────────────────────────────────────
     for joint in JOINTS_ALL:
         summary.update(
@@ -575,8 +604,6 @@ def build_summary_features(df_ts: pd.DataFrame,
 
     # ────────────────────────────────────────────────────
     # D. path_efficiency: 10관절 × 1 = 10개
-    #    Orth et al. (2017 Front Psychol)
-    #    Seifert et al. (2016 Hum Mov Sci)
     # ────────────────────────────────────────────────────
     for joint in JOINTS_ALL:
         summary[f"{joint}_path_efficiency"] = compute_path_efficiency(
@@ -585,8 +612,6 @@ def build_summary_features(df_ts: pd.DataFrame,
 
     # ────────────────────────────────────────────────────
     # E. horizontal_sway: 10관절 × 1 = 10개
-    #    Orth et al. (2017 Front Psychol)
-    #    Lamoth et al. (2009 Gait Posture)
     # ────────────────────────────────────────────────────
     for joint in JOINTS_ALL:
         summary[f"{joint}_horizontal_sway"] = float(
@@ -595,8 +620,6 @@ def build_summary_features(df_ts: pd.DataFrame,
 
     # ────────────────────────────────────────────────────
     # F. vertical_sway: 10관절 × 1 = 10개
-    #    Orth et al. (2017 Front Psychol)
-    #    Lamoth et al. (2009 Gait Posture)
     # ────────────────────────────────────────────────────
     for joint in JOINTS_ALL:
         summary[f"{joint}_vertical_sway"] = float(
@@ -605,9 +628,6 @@ def build_summary_features(df_ts: pd.DataFrame,
 
     # ────────────────────────────────────────────────────
     # G. symmetry: 4쌍 × 2방향(x/y) × mean/max/sd = 24개
-    #    Maloney (2019 J Strength Cond Res)
-    #    Bishop et al. (2018 Strength Cond J)
-    #    (center 관절은 좌우 중간값이므로 symmetry 제외)
     # ────────────────────────────────────────────────────
     for _, _, name in SYMMETRY_PAIRS:
         summary.update(
