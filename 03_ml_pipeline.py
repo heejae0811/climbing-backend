@@ -13,7 +13,7 @@ from sklearn.feature_selection import RFECV
 from sklearn.metrics import (
     confusion_matrix, precision_score, recall_score, f1_score,
     matthews_corrcoef, roc_auc_score, balanced_accuracy_score,
-    roc_curve, auc
+    roc_curve, auc, make_scorer
 )
 from sklearn.base import BaseEstimator, ClassifierMixin, clone
 from sklearn.inspection import permutation_importance
@@ -46,6 +46,9 @@ plt.rcParams["axes.unicode_minus"] = False
 INSTABILITY_STABLE     = 0.10
 INSTABILITY_ACCEPTABLE = 0.15
 INSTABILITY_UNSTABLE   = 0.20
+
+# MCC scorer
+mcc_scorer = make_scorer(matthews_corrcoef)
 
 
 class CatBoostClassifierSklearn(CatBoostClassifier, ClassifierMixin, BaseEstimator):
@@ -170,7 +173,7 @@ def data_split(X, y, groups, test_size=0.2, random_state=RANDOM_STATE, verbose=T
     return X_train, X_test, y_train, y_test, groups_train, groups_test, test_idx
 
 
-def feature_selection(X_train, y_train, feature_cols, min_features=5, verbose=True):
+def feature_selection(X_train, y_train, feature_cols, verbose=True):
     """
     Hybrid Feature Selection: mRMR → RFECV
 
@@ -181,7 +184,7 @@ def feature_selection(X_train, y_train, feature_cols, min_features=5, verbose=Tr
     Stage 2. RFECV (Recursive Feature Elimination with Cross-Validation)
       - mRMR 결과를 입력으로 사용
       - Random Forest 기반 feature importance로 반복 제거
-      - StratifiedKFold 5-fold CV, 최적화 지표: F1-score
+      - StratifiedKFold 5-fold CV, 최적화 지표: MCC
       - 최적 feature 수 자동 결정
     """
     if verbose:
@@ -192,7 +195,7 @@ def feature_selection(X_train, y_train, feature_cols, min_features=5, verbose=Tr
     if verbose:
         print("\n  [Stage 1] mRMR")
 
-    K = max(min_features, int(np.sqrt(len(feature_cols))))
+    K = int(np.sqrt(len(feature_cols)))
     K = min(K, len(feature_cols))
 
     try:
@@ -219,8 +222,7 @@ def feature_selection(X_train, y_train, feature_cols, min_features=5, verbose=Tr
         estimator=RandomForestClassifier(n_estimators=100, random_state=RANDOM_STATE, n_jobs=-1),
         step=1,
         cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE),
-        scoring="f1",
-        min_features_to_select=min_features,
+        scoring=mcc_scorer,
         n_jobs=-1
     )
 
@@ -235,9 +237,6 @@ def feature_selection(X_train, y_train, feature_cols, min_features=5, verbose=Tr
         if verbose:
             print(f"  RFECV 실패: {e} → mRMR 결과 그대로 사용")
         final_selected = mrmr_selected
-
-    if len(final_selected) < min_features:
-        final_selected = mrmr_selected[:min_features]
 
     if verbose:
         print(f"\n  ✓ 최종 선택 feature: {len(final_selected)}개")
@@ -350,6 +349,7 @@ NUMERIC_METRIC_COLS = [
     "Specificity", "Sensitivity", "Balanced_Accuracy", "MCC", "AUC"
 ]
 
+
 def _apply_number_format(writer, sheet_name):
     ws     = writer.sheets[sheet_name]
     header = [cell.value for cell in ws[1]]
@@ -367,7 +367,7 @@ def save_results(results, y_test, y_proba_dict):
 
     excel_path = os.path.join(RESULT_DIR, "model_results.xlsx")
     with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
-        df_results.sort_values("F1", ascending=False).to_excel(
+        df_results.sort_values("MCC", ascending=False).to_excel(
             writer, sheet_name="Results", index=False
         )
         _apply_number_format(writer, "Results")
@@ -391,21 +391,34 @@ def save_results(results, y_test, y_proba_dict):
     plt.close()
     print("  저장: roc_curve.png")
 
-    df_show = df_results.sort_values("F1", ascending=False)
+    df_show = df_results.sort_values("MCC", ascending=False)
     print("\n" + "=" * 70)
-    print("  모델 성능 요약 (F1 기준 정렬)")
+    print("  모델 성능 요약 (MCC 기준 정렬)")
     print("=" * 70)
     print(df_show[["Model","Accuracy","F1","MCC","AUC","Sensitivity","Specificity"]].to_string(index=False))
     print("=" * 70)
     best = df_show.iloc[0]
-    print(f"\n  Best Model: {best['Model']}  F1={best['F1']:.2f}  AUC={best['AUC']}")
+    print(f"\n  Best Model: {best['Model']}  MCC={best['MCC']:.2f}  AUC={best['AUC']}")
 
 
-def is_valid_subset(y_sub, groups_sub):
-    return len(np.unique(y_sub)) >= 2 and len(np.unique(groups_sub)) >= 4
-
+# =========================================================
+# Sample Size Instability Analysis
+# Bootstrap 기반 예측 불안정성 평가
+#
+# 방법: Riley & Collins (2023 Biom J); Riley et al. (2025 Lancet Digit Health)
+#
+# 각 표본 비율(10~90%)에서:
+#   1) 전체 데이터에서 해당 비율만큼 participant 단위로 서브샘플링
+#   2) 서브샘플에서 bootstrap 200회 반복
+#      - 매 반복마다 bootstrap 샘플로 학습, 원본 서브샘플로 평가
+#   3) MCC의 SD = 예측 불안정성(instability)
+#
+# 참고: Riley et al. (2025)은 bootstrap 모델 간 개인별 예측값의
+#       변동성을 instability로 정의하며, SD가 클수록 불안정함을 의미
+# =========================================================
 
 def subset_by_group_fraction_stratified(X, y, groups, fraction, random_state=42):
+    """Participant 단위 계층적 서브샘플링"""
     df_groups      = pd.DataFrame({"group": groups, "label": y})
     group_label_df = df_groups.groupby("group")["label"].first().reset_index()
     rng            = np.random.RandomState(random_state)
@@ -420,13 +433,24 @@ def subset_by_group_fraction_stratified(X, y, groups, fraction, random_state=42)
     return X.loc[mask].reset_index(drop=True), y[mask], groups[mask]
 
 
+def is_valid_subset(y_sub, groups_sub):
+    return len(np.unique(y_sub)) >= 2 and len(np.unique(groups_sub)) >= 4
+
+
 def sample_size_analysis(X, y, groups, feature_cols,
                          fractions=(0.1, 0.3, 0.5, 0.7, 0.9),
-                         test_size=0.2, min_features=5, n_repeats=100):
+                         n_bootstrap=100):
+    """
+    Bootstrap 기반 예측 불안정성 분석
+    Riley & Collins (2023 Biom J); Riley et al. (2025 Lancet Digit Health)
+
+    각 표본 비율에서 200회 bootstrap 반복 → MCC의 SD = instability
+    Participant 단위 bootstrap으로 데이터 누출 방지
+    """
     print("\n" + "=" * 70)
-    print("  [Sample Size Analysis]  Prediction Instability")
-    print("  방법: Kim & Park (2026) Figure 2")
-    print(f"  각 표본 비율에서 {n_repeats}회 반복 → F1의 SD = Instability")
+    print("  [Sample Size Analysis]  Prediction Instability (Bootstrap)")
+    print("  방법: Riley & Collins (2023); Riley et al. (2025)")
+    print(f"  각 표본 비율에서 bootstrap {n_bootstrap}회 → MCC의 SD = Instability")
     print("=" * 70)
 
     models      = build_models()
@@ -437,50 +461,75 @@ def sample_size_analysis(X, y, groups, feature_cols,
         pct = int(frac * 100)
         print(f"\n{'─'*70}\n  샘플 비율 {pct}%\n{'─'*70}")
 
-        for rep in range(n_repeats):
-            seed = RANDOM_STATE + rep
-            X_sub, y_sub, groups_sub = subset_by_group_fraction_stratified(
-                X, y, groups, fraction=frac, random_state=seed)
+        # 해당 비율만큼 participant 단위 서브샘플링
+        X_sub, y_sub, groups_sub = subset_by_group_fraction_stratified(
+            X, y, groups, fraction=frac, random_state=RANDOM_STATE)
 
-            if not is_valid_subset(y_sub, groups_sub):
+        if not is_valid_subset(y_sub, groups_sub):
+            print(f"  {pct}% — 유효하지 않은 서브샘플 (클래스 또는 participant 부족), 건너뜀")
+            continue
+
+        unique_groups = np.unique(groups_sub)
+        n_groups      = len(unique_groups)
+
+        # feature selection (mRMR만 사용, 속도 고려)
+        try:
+            K         = int(np.sqrt(len(feature_cols)))
+            K         = min(K, len(feature_cols))
+            sel_feats = list(mrmr_classif(
+                X=X_sub[feature_cols].copy(), y=pd.Series(y_sub), K=K
+            ))
+        except Exception:
+            sel_feats = list(feature_cols)
+
+        # Bootstrap 200회 반복
+        # Participant 단위 bootstrap: group을 복원추출 후 해당 샘플 사용
+        for rep in range(n_bootstrap):
+            rng = np.random.RandomState(RANDOM_STATE + rep)
+
+            # Participant 단위 bootstrap 샘플링 (복원추출)
+            boot_groups = rng.choice(unique_groups, size=n_groups, replace=True)
+
+            # bootstrap train 인덱스 수집
+            boot_train_idx = []
+            for g in boot_groups:
+                idx = np.where(groups_sub == g)[0]
+                boot_train_idx.extend(idx.tolist())
+
+            # out-of-bag(OOB) 인덱스: bootstrap에 포함되지 않은 participant
+            oob_groups = np.setdiff1d(unique_groups, np.unique(boot_groups))
+            if len(oob_groups) == 0:
                 continue
+            oob_idx = np.where(np.isin(groups_sub, oob_groups))[0]
 
-            try:
-                X_tr, X_te, y_tr, y_te, _, _, _ = data_split(
-                    X_sub, y_sub, groups_sub,
-                    test_size=test_size, random_state=seed, verbose=False)
-            except Exception:
+            X_boot_tr = X_sub.iloc[boot_train_idx][sel_feats].reset_index(drop=True)
+            y_boot_tr = y_sub[boot_train_idx]
+            X_boot_te = X_sub.iloc[oob_idx][sel_feats].reset_index(drop=True)
+            y_boot_te = y_sub[oob_idx]
+
+            # 클래스 다양성 확인
+            if len(np.unique(y_boot_tr)) < 2 or len(np.unique(y_boot_te)) < 2:
                 continue
-
-            if len(np.unique(y_tr)) < 2 or len(np.unique(y_te)) < 2:
-                continue
-
-            # 반복 속도를 위해 mRMR만 적용 (RFECV는 계산 비용 높음)
-            try:
-                K         = max(min_features, int(np.sqrt(len(feature_cols))))
-                K         = min(K, len(feature_cols))
-                sel_feats = list(mrmr_classif(
-                    X=X_tr[feature_cols].copy(), y=pd.Series(y_tr), K=K
-                ))
-            except Exception:
-                sel_feats = list(feature_cols)
 
             for model_name in model_names:
                 try:
                     _, _, metrics = evaluate_model(
                         models[model_name], model_name,
-                        X_tr[sel_feats], y_tr,
-                        X_te[sel_feats], y_te, verbose=False)
+                        X_boot_tr, y_boot_tr,
+                        X_boot_te, y_boot_te,
+                        verbose=False
+                    )
                     all_rows.append({
                         "sample_size_percent": pct,
                         "model":               model_name,
-                        "repeat":              rep + 1,
-                        "F1":                  metrics["F1_raw"],
+                        "bootstrap":           rep + 1,
+                        "MCC":                 metrics["MCC_raw"],
                     })
                 except Exception:
                     pass
 
-        print(f"  {pct}% 완료")
+        valid_reps = len([r for r in all_rows if r["sample_size_percent"] == pct])
+        print(f"  {pct}% 완료 (유효 반복: {valid_reps}건)")
 
     df_raw = pd.DataFrame(all_rows)
     if df_raw.empty:
@@ -491,9 +540,9 @@ def sample_size_analysis(X, y, groups, feature_cols,
         df_raw
         .groupby(["sample_size_percent", "model"], as_index=False)
         .agg(
-            instability=("F1", "std"),
-            F1_mean=("F1", "mean"),
-            n_valid_repeats=("F1", "count"),
+            instability=("MCC", "std"),
+            MCC_mean=("MCC", "mean"),
+            n_valid_bootstrap=("MCC", "count"),
         )
     )
 
@@ -519,28 +568,36 @@ def _plot_prediction_instability(df_instability, model_names, fractions):
                .sort_values("sample_size_percent"))
         if tmp.empty:
             continue
-        ax.plot(tmp["sample_size_percent"], tmp["instability"], marker="o", linewidth=1.8, color=colors[model_name], label=model_name)
+        ax.plot(tmp["sample_size_percent"], tmp["instability"],
+                marker="o", linewidth=1.8,
+                color=colors[model_name], label=model_name)
 
-    ax.axhline(y=INSTABILITY_STABLE,     color="black", linestyle="-",  linewidth=1.0, label=f"Stable ({INSTABILITY_STABLE})")
-    ax.axhline(y=INSTABILITY_ACCEPTABLE, color="black", linestyle="--", linewidth=1.0, label=f"Acceptable ({INSTABILITY_ACCEPTABLE})")
-    ax.axhline(y=INSTABILITY_UNSTABLE,   color="black", linestyle=":",  linewidth=1.0, label=f"Unstable ({INSTABILITY_UNSTABLE})")
+    ax.axhline(y=INSTABILITY_STABLE,     color="black", linestyle="-",
+               linewidth=1.0, label=f"Stable (≤{INSTABILITY_STABLE})")
+    ax.axhline(y=INSTABILITY_ACCEPTABLE, color="black", linestyle="--",
+               linewidth=1.0, label=f"Acceptable (≤{INSTABILITY_ACCEPTABLE})")
+    ax.axhline(y=INSTABILITY_UNSTABLE,   color="black", linestyle=":",
+               linewidth=1.0, label=f"Unstable (>{INSTABILITY_UNSTABLE})")
 
     ax.set_xlabel("Sample size (%)", fontsize=12)
-    ax.set_ylabel("Average instability (SD)", fontsize=12)
+    ax.set_ylabel("Prediction instability (SD of MCC)", fontsize=12)
     ax.set_xticks(pct_list)
     ax.set_ylim(0, max(0.35, df_instability["instability"].max() + 0.05))
     ax.legend(loc="upper right", fontsize=8, ncol=2)
     ax.grid(alpha=0.3)
     plt.tight_layout()
-    fig.savefig(os.path.join(RESULT_DIR, "sample_size_instability.png"), dpi=300, bbox_inches="tight")
+    fig.savefig(os.path.join(RESULT_DIR, "sample_size_instability.png"),
+                dpi=300, bbox_inches="tight")
     plt.close()
     print("  저장: sample_size_instability.png")
 
 
 def _print_instability_summary(df_instability, fractions):
     print("\n" + "=" * 70)
-    print("  Prediction Instability 요약")
-    print(f"  기준: Stable ≤ {INSTABILITY_STABLE} | Acceptable ≤ {INSTABILITY_ACCEPTABLE} | Unstable > {INSTABILITY_UNSTABLE}")
+    print("  Prediction Instability 요약 (Bootstrap 기반, Riley et al. 2025)")
+    print(f"  기준: Stable ≤{INSTABILITY_STABLE} | "
+          f"Acceptable ≤{INSTABILITY_ACCEPTABLE} | "
+          f"Unstable >{INSTABILITY_UNSTABLE}")
     print("=" * 70)
 
     for frac in fractions:
@@ -568,18 +625,20 @@ def _print_instability_summary(df_instability, fractions):
             break
 
     if stable_pct is not None:
-        print(f"\n  → 모델 성능이 {stable_pct}% 이상에서 안정화됨 (instability ≤ {INSTABILITY_ACCEPTABLE})")
+        print(f"\n  → {stable_pct}% 이상에서 안정화 (instability ≤{INSTABILITY_ACCEPTABLE})")
     else:
         print("\n  → 분석된 범위 내에서 안정화 구간 미달성")
     print("=" * 70)
 
 
-def save_best_model_extras(best_model, best_model_name, X_test_fs, y_test, selected_features, class_names):
+def save_best_model_extras(best_model, best_model_name,
+                           X_test_fs, y_test, selected_features, class_names):
     y_pred = best_model.predict(X_test_fs)
     cm     = confusion_matrix(y_test, y_pred, labels=[0, 1])
 
     plt.figure(figsize=(6, 5))
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=class_names, yticklabels=class_names)
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=class_names, yticklabels=class_names)
     plt.title(f"Confusion Matrix — {best_model_name}")
     plt.xlabel("Predicted Label")
     plt.ylabel("True Label")
@@ -587,9 +646,11 @@ def save_best_model_extras(best_model, best_model_name, X_test_fs, y_test, selec
     plt.savefig(os.path.join(RESULT_DIR, "best_confusion_matrix.png"), dpi=300)
     plt.close()
 
-    perm = permutation_importance(best_model, X_test_fs, y_test,
-                                  scoring="f1", n_repeats=100,
-                                  random_state=RANDOM_STATE, n_jobs=-1)
+    perm = permutation_importance(
+        best_model, X_test_fs, y_test,
+        scoring=mcc_scorer, n_repeats=1,
+        random_state=RANDOM_STATE, n_jobs=-1
+    )
     df_fi = pd.DataFrame({
         "Feature":    selected_features,
         "Importance": np.round(perm.importances_mean, 4),
@@ -598,24 +659,18 @@ def save_best_model_extras(best_model, best_model_name, X_test_fs, y_test, selec
 
     df_fi.to_excel(os.path.join(RESULT_DIR, "feature_importance.xlsx"), index=False)
     plt.figure(figsize=(8, 6))
-    plt.barh(df_fi["Feature"], df_fi["Importance"], xerr=df_fi["Std"], align="center")
+    plt.barh(df_fi["Feature"], df_fi["Importance"],
+             xerr=df_fi["Std"], align="center")
     plt.gca().invert_yaxis()
-    plt.title(f"Feature Importance (Permutation, F1) — {best_model_name}")
+    plt.title(f"Feature Importance (Permutation, MCC) — {best_model_name}")
     plt.xlabel("Mean Importance")
     plt.tight_layout()
     plt.savefig(os.path.join(RESULT_DIR, "feature_importance_plot.png"), dpi=300)
     plt.close()
 
 
-# =====================================================
-# LIME 샘플 모드 설정
-# "all"     : 전체 test sample
-# "correct" : 정분류만
-# "wrong"   : 오분류만
-# "n"       : 랜덤 n개 (LIME_SAMPLE_N 설정)
-# =====================================================
 LIME_SAMPLE_MODE = "all"
-LIME_SAMPLE_N    = 10   # LIME_SAMPLE_MODE = "n" 일 때만 사용
+LIME_SAMPLE_N    = 10
 
 FEATURE_NAME_MAP = {
     "hip_center_velocity_mean":      "Hip velocity",
@@ -626,11 +681,13 @@ FEATURE_NAME_MAP = {
     "left_hip_velocity_mean":        "Left hip velocity",
     "hip_center_acceleration_sd":    "Hip acceleration consistency",
     "shoulder_center_velocity_mean": "Shoulder velocity",
+    "right_hip_velocity_mean":       "Right hip velocity",
+    "right_wrist_vertical_sway":     "Right wrist vertical sway",
+    "hip_y_symmetry_sd":             "Hip vertical symmetry consistency",
 }
 
 
 def _lime_select_indices(y_pred, y_test):
-    """LIME_SAMPLE_MODE에 따라 대상 샘플 인덱스 반환"""
     correct_idx = np.where(y_pred == y_test)[0]
     wrong_idx   = np.where(y_pred != y_test)[0]
 
@@ -657,25 +714,17 @@ def _lime_select_indices(y_pred, y_test):
     return indices
 
 
-def xai_lime(best_model, X_train, X_test, y_test, selected_features, class_names,
-             sample_ids=None):
-    """
-    Test data 샘플에 대해 LIME HTML 파일 생성
-    LIME_SAMPLE_MODE로 대상 샘플 범위 조정 가능
-
-    저장 위치: result/lime/
-    파일명 형식: {sample_id}_true-{true_label}_pred-{pred_label}_{O/X}.html
-    """
+def xai_lime(best_model, X_train, X_test, y_test,
+             selected_features, class_names, sample_ids=None):
     print("\n[XAI] LIME")
     try:
         if not hasattr(best_model, "predict_proba"):
             print("  LIME 생략: predict_proba 미지원")
             return
 
-        pretty = [FEATURE_NAME_MAP.get(f, f) for f in selected_features]
-
-        # 스케일링
+        pretty     = [FEATURE_NAME_MAP.get(f, f) for f in selected_features]
         has_scaler = "scaler" in best_model.named_steps
+
         if has_scaler:
             sc     = best_model.named_steps["scaler"]
             X_tr_l = pd.DataFrame(sc.transform(X_train), columns=selected_features)
@@ -684,11 +733,9 @@ def xai_lime(best_model, X_train, X_test, y_test, selected_features, class_names
             X_tr_l = X_train.copy()
             X_te_l = X_test.copy()
 
-        # sample_ids 설정
         if sample_ids is None:
             sample_ids = [str(i) for i in range(len(X_te_l))]
 
-        # LIME explainer 생성
         explainer = LimeTabularExplainer(
             training_data=X_tr_l.values,
             feature_names=pretty,
@@ -700,7 +747,6 @@ def xai_lime(best_model, X_train, X_test, y_test, selected_features, class_names
         y_pred  = best_model.predict(X_test)
         indices = _lime_select_indices(y_pred, y_test)
 
-        # 저장 폴더
         lime_dir = os.path.join(RESULT_DIR, "lime")
         os.makedirs(lime_dir, exist_ok=True)
 
@@ -734,18 +780,23 @@ def xai_shap(best_model, X_train, X_test, selected_features):
         pretty      = [FEATURE_NAME_MAP.get(f, f) for f in selected_features]
         has_scaler  = "scaler" in best_model.named_steps
         model_step  = best_model.named_steps["model"]
-        tree_models = {"DecisionTreeClassifier", "RandomForestClassifier",
-                       "GradientBoostingClassifier", "LGBMClassifier",
-                       "XGBClassifier", "CatBoostClassifier", "CatBoostClassifierSklearn"}
+        tree_models = {
+            "DecisionTreeClassifier", "RandomForestClassifier",
+            "GradientBoostingClassifier", "LGBMClassifier",
+            "XGBClassifier", "CatBoostClassifier", "CatBoostClassifierSklearn"
+        }
         is_tree = model_step.__class__.__name__ in tree_models
 
         X_bg  = X_train.sample(n=min(50, len(X_train)), random_state=RANDOM_STATE)
         X_exp = X_test.iloc[:min(50, len(X_test))].copy().reset_index(drop=True)
 
         if is_tree:
-            X_exp_in = (pd.DataFrame(
-                best_model.named_steps["scaler"].transform(X_exp), columns=selected_features
-            ) if has_scaler else X_exp.copy())
+            X_exp_in = (
+                pd.DataFrame(
+                    best_model.named_steps["scaler"].transform(X_exp),
+                    columns=selected_features
+                ) if has_scaler else X_exp.copy()
+            )
             explainer = shap.TreeExplainer(model_step)
             shap_obj  = explainer(X_exp_in)
             raw, base = shap_obj.values, shap_obj.base_values
@@ -755,31 +806,42 @@ def xai_shap(best_model, X_train, X_test, selected_features):
                 base_values = base[:, 1] if np.ndim(base) > 1 else base
             else:
                 values, base_values = raw, base
-            expl = shap.Explanation(values=values, base_values=base_values,
-                                    data=data_plot, feature_names=pretty)
+            expl = shap.Explanation(
+                values=values, base_values=base_values,
+                data=data_plot, feature_names=pretty
+            )
         else:
             sc      = best_model.named_steps["scaler"] if has_scaler else None
             X_bg_t  = pd.DataFrame(sc.transform(X_bg),  columns=selected_features) if sc else X_bg.copy()
             X_exp_t = pd.DataFrame(sc.transform(X_exp), columns=selected_features) if sc else X_exp.copy()
-            ke = shap.KernelExplainer(model_step.predict_proba, X_bg_t)
-            sv = ke.shap_values(X_exp_t, nsamples=100)
+            ke      = shap.KernelExplainer(model_step.predict_proba, X_bg_t)
+            sv      = ke.shap_values(X_exp_t, nsamples=100)
             if isinstance(sv, list):
                 values   = sv[1]
-                base_val = ke.expected_value[1] if isinstance(ke.expected_value, (list, np.ndarray)) else ke.expected_value
+                base_val = (ke.expected_value[1]
+                            if isinstance(ke.expected_value, (list, np.ndarray))
+                            else ke.expected_value)
             else:
                 sv_np    = np.array(sv)
                 values   = sv_np[:, :, 1] if sv_np.ndim == 3 else sv_np
-                base_val = ke.expected_value[1] if isinstance(ke.expected_value, (list, np.ndarray)) else ke.expected_value
-            expl = shap.Explanation(values=values,
-                                    base_values=np.repeat(base_val, X_exp_t.shape[0]),
-                                    data=X_exp_t.values, feature_names=pretty)
+                base_val = (ke.expected_value[1]
+                            if isinstance(ke.expected_value, (list, np.ndarray))
+                            else ke.expected_value)
+            expl = shap.Explanation(
+                values=values,
+                base_values=np.repeat(base_val, X_exp_t.shape[0]),
+                data=X_exp_t.values,
+                feature_names=pretty
+            )
 
-        plt.figure(figsize=(8, 6))
-        shap.plots.beeswarm(expl, show=False)
+        plt.figure(figsize=(10, max(6, len(selected_features) * 0.5)))
+        shap.plots.beeswarm(expl, max_display=len(selected_features), show=False)
         plt.tight_layout()
-        plt.savefig(os.path.join(RESULT_DIR, "shap_beeswarm.png"), dpi=300, bbox_inches="tight")
+        plt.savefig(os.path.join(RESULT_DIR, "shap_beeswarm.png"),
+                    dpi=300, bbox_inches="tight")
         plt.close()
         print("  SHAP 완료")
+
     except Exception as e:
         print(f"  SHAP 실패: {e}")
 
@@ -793,18 +855,17 @@ def main():
     X, y, groups, feature_cols, class_names = data_loading()
 
     # 2. Train/Test 분리
-    X_train, X_test, y_train, y_test, groups_train, groups_test, test_idx = data_split(
-        X, y, groups, test_size=0.2, random_state=RANDOM_STATE, verbose=True)
+    (X_train, X_test, y_train, y_test,
+     groups_train, groups_test, test_idx) = data_split(
+        X, y, groups, test_size=0.2,
+        random_state=RANDOM_STATE, verbose=True
+    )
 
-    # video id 추출 (파일명 기반, LIME 파일명에 사용)
-    # data_loading에서 X의 인덱스는 원본 df 기준이므로 X_test 인덱스로 추출
-    video_ids_test = [
-        f"{groups[i]}_{y[i]}" for i in test_idx
-    ]
+    video_ids_test = [f"{groups[i]}_{y[i]}" for i in test_idx]
 
-    # 3. Feature Selection — Hybrid (mRMR → RFECV)
+    # 3. Feature Selection — Hybrid (mRMR → RFECV, MCC 기준)
     selected_features = feature_selection(
-        X_train, y_train, feature_cols, min_features=5, verbose=True)
+        X_train, y_train, feature_cols, verbose=True)
 
     X_train_fs = X_train[selected_features]
     X_test_fs  = X_test[selected_features]
@@ -813,44 +874,57 @@ def main():
     models       = build_models()
     results      = []
     y_proba_dict = {}
-    best_model, best_model_name, best_f1 = None, None, -999
+    best_model, best_model_name, best_mcc = None, None, -999
 
     for model_name, pipeline in models.items():
         print(f"\n{'─'*55}\n  {model_name}\n{'─'*55}")
         try:
             trained, y_proba, metrics = evaluate_model(
                 pipeline, model_name,
-                X_train_fs, y_train, X_test_fs, y_test, verbose=True)
+                X_train_fs, y_train,
+                X_test_fs, y_test, verbose=True
+            )
             results.append(metrics)
             y_proba_dict[model_name] = y_proba
-            if metrics["F1_raw"] > best_f1:
-                best_f1, best_model, best_model_name = metrics["F1_raw"], trained, model_name
+            if metrics["MCC_raw"] > best_mcc:
+                best_mcc        = metrics["MCC_raw"]
+                best_model      = trained
+                best_model_name = model_name
         except Exception as e:
             print(f"  실패: {e}")
 
     # 5. 결과 저장
     save_results(results, y_test, y_proba_dict)
 
-    # 6. Sample Size Analysis (Prediction Instability)
+    # 6. Sample Size Analysis
+    # Bootstrap 기반 예측 불안정성 분석
+    # Riley & Collins (2023 Biom J); Riley et al. (2025 Lancet Digit Health)
     sample_size_analysis(
         X, y, groups, feature_cols,
         fractions=(0.1, 0.3, 0.5, 0.7, 0.9),
-        test_size=0.2, min_features=5, n_repeats=100)
+        n_bootstrap=100
+    )
 
     # 7. Best Model 부가 결과
     if best_model is not None:
         print(f"\n{'='*70}")
-        print(f"  Best Model: {best_model_name}  F1={best_f1:.2f}")
+        print(f"  Best Model: {best_model_name}  MCC={best_mcc:.2f}")
         print(f"{'='*70}")
         save_best_model_extras(
             best_model, best_model_name,
-            X_test_fs, y_test, selected_features, class_names)
-        xai_lime(best_model, X_train_fs, X_test_fs, y_test, selected_features, class_names,
-                 sample_ids=video_ids_test)
+            X_test_fs, y_test, selected_features, class_names
+        )
+        xai_lime(
+            best_model, X_train_fs, X_test_fs,
+            y_test, selected_features, class_names,
+            sample_ids=video_ids_test
+        )
         xai_shap(best_model, X_train_fs, X_test_fs, selected_features)
 
-        joblib.dump(best_model,        os.path.join(RESULT_DIR, "best_model.pkl"))
-        joblib.dump(selected_features, os.path.join(RESULT_DIR, "best_features.pkl"))
+        joblib.dump(best_model,
+                    os.path.join(RESULT_DIR, "best_model.pkl"))
+        joblib.dump(selected_features,
+                    os.path.join(RESULT_DIR, "best_features.pkl"))
         print("  모델 저장 완료: best_model.pkl / best_features.pkl")
 
     print("\n전체 파이프라인 완료!")
