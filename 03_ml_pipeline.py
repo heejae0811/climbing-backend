@@ -461,7 +461,6 @@ def sample_size_analysis(X, y, groups, feature_cols,
         pct = int(frac * 100)
         print(f"\n{'─'*70}\n  샘플 비율 {pct}%\n{'─'*70}")
 
-        # 해당 비율만큼 participant 단위 서브샘플링
         X_sub, y_sub, groups_sub = subset_by_group_fraction_stratified(
             X, y, groups, fraction=frac, random_state=RANDOM_STATE)
 
@@ -472,7 +471,6 @@ def sample_size_analysis(X, y, groups, feature_cols,
         unique_groups = np.unique(groups_sub)
         n_groups      = len(unique_groups)
 
-        # feature selection (mRMR만 사용, 속도 고려)
         try:
             K         = int(np.sqrt(len(feature_cols)))
             K         = min(K, len(feature_cols))
@@ -482,21 +480,16 @@ def sample_size_analysis(X, y, groups, feature_cols,
         except Exception:
             sel_feats = list(feature_cols)
 
-        # Bootstrap 200회 반복
-        # Participant 단위 bootstrap: group을 복원추출 후 해당 샘플 사용
         for rep in range(n_bootstrap):
             rng = np.random.RandomState(RANDOM_STATE + rep)
 
-            # Participant 단위 bootstrap 샘플링 (복원추출)
             boot_groups = rng.choice(unique_groups, size=n_groups, replace=True)
 
-            # bootstrap train 인덱스 수집
             boot_train_idx = []
             for g in boot_groups:
                 idx = np.where(groups_sub == g)[0]
                 boot_train_idx.extend(idx.tolist())
 
-            # out-of-bag(OOB) 인덱스: bootstrap에 포함되지 않은 participant
             oob_groups = np.setdiff1d(unique_groups, np.unique(boot_groups))
             if len(oob_groups) == 0:
                 continue
@@ -507,7 +500,6 @@ def sample_size_analysis(X, y, groups, feature_cols,
             X_boot_te = X_sub.iloc[oob_idx][sel_feats].reset_index(drop=True)
             y_boot_te = y_sub[oob_idx]
 
-            # 클래스 다양성 확인
             if len(np.unique(y_boot_tr)) < 2 or len(np.unique(y_boot_te)) < 2:
                 continue
 
@@ -674,13 +666,13 @@ LIME_SAMPLE_N    = 10
 
 FEATURE_NAME_MAP = {
     "hip_center_velocity_mean":      "Hip velocity",
-    "shoulder_y_symmetry_mean":      "Shoulder vertical symmetry",
+    "shoulder_y_symmetry_mean":      "Upper body vertical symmetry",
     "hip_center_jerk_sd":            "Hip smoothness",
     "hip_center_velocity_sd":        "Hip velocity consistency",
-    "left_shoulder_vertical_sway":   "Left shoulder vertical sway",
+    "left_shoulder_vertical_sway":   "Left upper body vertical sway",
     "left_hip_velocity_mean":        "Left hip velocity",
     "hip_center_acceleration_sd":    "Hip acceleration consistency",
-    "shoulder_center_velocity_mean": "Shoulder velocity",
+    "shoulder_center_velocity_mean": "Upper body velocity",
     "right_hip_velocity_mean":       "Right hip velocity",
     "right_wrist_vertical_sway":     "Right wrist vertical sway",
     "hip_y_symmetry_sd":             "Hip vertical symmetry consistency",
@@ -744,6 +736,9 @@ def xai_lime(best_model, X_train, X_test, y_test,
             random_state=RANDOM_STATE
         )
 
+        # scaler 제외한 모델 스텝만 추출 (루프 밖에서 한 번만)
+        model_step = best_model.named_steps["model"]
+
         y_pred  = best_model.predict(X_test)
         indices = _lime_select_indices(y_pred, y_test)
 
@@ -752,20 +747,25 @@ def xai_lime(best_model, X_train, X_test, y_test,
 
         print(f"  처리 중...")
         for rank, idx in enumerate(indices, start=1):
-            sid          = sample_ids[idx]
-            true_label   = class_names[y_test[idx]]
-            pred_label   = class_names[y_pred[idx]]
-            correct_mark = "O" if y_test[idx] == y_pred[idx] else "X"
+            sid            = sample_ids[idx]
+            true_label     = class_names[y_test[idx]]
+            pred_label     = class_names[y_pred[idx]]
+            correct_mark   = "O" if y_test[idx] == y_pred[idx] else "X"
+            pred_class_idx = int(y_pred[idx])   # 0=Advanced, 1=Intermediate
 
             exp = explainer.explain_instance(
                 X_te_l.iloc[idx].values,
-                best_model.predict_proba,
+                model_step.predict_proba,        # ← 이중 스케일링 방지: 모델 스텝만 사용
                 num_features=len(selected_features),
-                num_samples=5000
+                num_samples=5000,
+                labels=(pred_class_idx,)         # ← 예측 클래스 기준으로 설명 생성
             )
 
             filename = f"{sid}_true-{true_label}_pred-{pred_label}_{correct_mark}.html"
-            exp.save_to_file(os.path.join(lime_dir, filename))
+            exp.save_to_file(
+                os.path.join(lime_dir, filename),
+                labels=(pred_class_idx,)         # ← HTML 내부 표시 클래스도 동일하게 지정
+            )
             print(f"  [{rank}/{len(indices)}] {filename}")
 
         print(f"  저장 완료: result/lime/ ({len(indices)}개 HTML)")
@@ -902,7 +902,7 @@ def main():
     sample_size_analysis(
         X, y, groups, feature_cols,
         fractions=(0.1, 0.3, 0.5, 0.7, 0.9),
-        n_bootstrap=100
+        n_bootstrap=1
     )
 
     # 7. Best Model 부가 결과
